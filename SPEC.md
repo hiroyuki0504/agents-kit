@@ -457,7 +457,7 @@ C/C++ は正規表現での関数定義抽出が不安定なため v1 では対�
 
   `worktree_root` は ROOT 相対（絶対パスも可）。`pr` は `"auto"`（gh があり remote URL に `github.com` を含む時だけ PR 作成）| `"off"`。`merge_lock_ttl_min` は**フルテスト所要時間の 2 倍以上**を推奨（install.sh 生成時のコメントと PROTOCOL に明記。ハートビートがあるため下回っても安全性は壊れないが、警告が増える）。
 - **自 claim の定義（I-OWNER）**: `git rev-parse --absolute-git-dir` 直下の `agents.json`（`{"slug","agent","branch"}`）が示す (slug, agent) に対し、state 上の `claims/<slug>.json` が存在し**かつ** `claim.agent` が一致するもの。agents.json が無ければ「claim worktree 外」。ファイル存在＋slug 一致だけで自 claim と判定してはならない（evict→再claim 後のゾンビが新所有者の claim を壊す）。
-- 出力は日本語の人間可読テキスト。`sync` / `status` は `--json` を持つ（後述のスキーマで機械可読）。テスト・ビルドの出力は子プロセスの stdout/stderr をそのまま継承して流す。
+- 出力は日本語の人間可読テキスト。`sync` / `status` は `--json` を持つ（後述のスキーマで機械可読）。テスト・ビルドの出力は**チャンク単位の無遅延 tee** で流す（読んだバイトを即 stdout へ転写しつつ、失敗表示用に末尾 `TEST_LOG_TAIL` 行を捕捉する。行バッファでの転写は禁止 — 改行を伴わない進捗出力が滞留して停止に見え、merge を殺す誘因になる）。(impl-fix: 旧文「そのまま継承して流す」は TEST_LOG_TAIL の捕捉要件と両立しないため tee 方式に統一)
 - **固定リマインド行**: `directive` を除く全コマンドは、出力の最終行に必ず次を表示する:
   「※ ユーザーから受けた口頭指示で未記録のものは無いか? あれば次の行動より先に: agents directive "<指示の原文>"」
   （記録漏れは構造では防げない唯一の穴。機械的な反復表示で圧を掛ける）
@@ -514,7 +514,7 @@ fetch + 状態表示 + claim 延命。作業中の定期実行を義務づける
    - `孤児:` `<worktree_root>/` 直下のディレクトリのうち、どの claim の `worktree` とも一致しないもの（`merge-*` の残骸を含む）。「中身（未 push の作業）を確認し、ユーザーに報告してから片付けよ」を添える。
    - 警告ブロック:
      - test_cmd 未設定。
-     - **フック検査**: 実効フックパス（`git config --get core.hooksPath` があればそれを ROOT 相対で解決、無ければ `COMMON_GITDIR/hooks`）の `pre-push` に (i) マーカー `>>> agents-kit pre-push >>>` が有り、(ii) ブロック内に `refs/heads/<config.main_branch>` と `refs/heads/<config.state_branch>` の両文字列が有ること。いずれか欠如 → 「main 直 push 防壁が実効フックパスに無い/不整合。install.sh を再実行せよ」。
+     - **フック検査**: 実効フックパス（`git config --get core.hooksPath` があればそれを ROOT 相対で解決、無ければ `COMMON_GITDIR/hooks`）の `pre-push` を 4 点で検査する: (i) マーカー `>>> agents-kit pre-push >>>` が有り、(ii) ブロック内に `refs/heads/<config.main_branch>` と `refs/heads/<config.state_branch>` の両文字列が有り、(iii) ブロックより前に実行文が無い（shebang・コメント・空行のみ。前段の早期 exit による到達不能化の検知）、(iv) マーカー間ブロック**だけ**を sh で合成 stdin 実行し、トークン無しの保護 ref push が非 0、トークン有りおよび非保護 ref が 0 になること（ユーザーの後続フック本体は実行しない＝副作用なし）。いずれか欠如 → 「main 直 push 防壁が実効フックパスに無い/不整合。install.sh を再実行せよ」。(impl-fix: 文字列存在のみの検査は「exit 0 の後ろの死んだブロック」を健全と誤報告するため (iii)(iv) を追加)
      - stale claim・lock の存在（stale claim には「evict の前に `agents evict --dry-run` で確認せよ。自分の別ターミナルが生きているかもしれない」）。
      - `!! NEW` があるとき「NEW を読み、自分の作業と矛盾しないか判断せよ。矛盾したら PROTOCOL.md『新 directive と矛盾したら』へ。done/merge には --seen d<最大seq> が必要」。
      - 主 checkout の追跡ファイル dirty（`git -C ROOT status --porcelain -uno` 非空）→ 「主 checkout が汚れている。AI セッションは ROOT に書き込むな（人間の作業なら無視してよい）」。
@@ -535,7 +535,7 @@ fetch + 状態表示 + claim 延命。作業中の定期実行を義務づける
 2. `git status --porcelain` が非空なら exit 3。一覧を表示し「全てコミットせよ（rebase 途中ならば解消して git rebase --continue）」。
 3. READ-STATE。`claims/<slug>.json` が無い、**または `claim.agent != 自 agent`** → exit 8「claim は evict/release 済み、または同 slug が別セッションに再claim 済み。あなたの変更は claim に反映してはならない。PROTOCOL.md『claim が evict されていた』へ」。
 4. **directive ゲート**: `maxd` = 最大 directive seq。`claim.seen < maxd` のとき:
-   - `--seen` 無し → 未読 directive（seq > seen）を**全文**表示し、**その後に** exit 3「上記を読み、自分の作業と矛盾しないか判断せよ。記録漏れの口頭指示があるなら先に agents directive で記録せよ。矛盾が無いと判断した場合のみ、agents done --seen d%05d で復唱して再実行」（完成形コマンドを出力の先頭に置かない。読了前のコピペ通過を防ぐ）。
+   - `--seen` 無し → 未読 directive（seq > seen）を**全文**表示し、**その後に** exit 3「上記を読み、自分の作業と矛盾しないか判断せよ。記録漏れの口頭指示があるなら先に agents directive で記録せよ。矛盾が無いと判断した場合のみ、agents done --seen d%05d で復唱して再実行」（完成形コマンドを出力の先頭に置かない。読了前のコピペ通過を防ぐ。**全文と拒否文は同一ストリーム＝stdout に出す**: 拒否文を stderr に分けるとパイプ捕捉環境で stderr が先に flush され、完成形コマンドが全文より先頭に現れて本規定が無効化される (impl-fix)）。
    - `--seen != maxd` → 同上（さらに新しい directive が増えたケース。最新一覧を再表示）。
    - `--seen == maxd` → WRITE-STATE で `claim.seen = maxd`、`refreshed_at = NOW`（msg = `seen <slug> <maxd>`。**precheck はループ内で毎回**: claim 存在 ∧ agent 一致（不成立 exit 8）∧ maxd 再計算が --seen 値と一致（増えていたら exit 3 で最新を再表示））。続行。
 5. fetch main → `git rebase refs/remotes/R/M`。コンフリクトで停止したら exit 6: 「解消 → git add → git rebase --continue → 再度 agents done」（rebase は進行中のまま渡す。手順 2 が再実行時の番人になる）。
@@ -603,30 +603,38 @@ claim の自発的解放（成果を捨てる/作り直す時。branch と workt
 
 install.sh が**実効フックパス**（`core.hooksPath` 設定時はそのディレクトリ、未設定時は `<COMMON_GITDIR>/hooks`）の `pre-push` に設置する。`<MAIN>` / `<STATE>` は install 時に config の値を埋め込む（config 変更後は install.sh 再実行、と出力で案内）。
 
-マーカーブロック（既存フックがある場合はこのブロックだけを末尾に追記。単独設置時は shebang `#!/bin/sh` を先頭に、`exit 0` を末尾に付けた完全なファイルとして書く）:
+マーカーブロック（**既存フックがある場合は旧ブロックを除去した上で、このブロックだけを先頭 — shebang 直後 — に前置する。末尾追記は禁止**: 既存フックの早期 `exit 0`（手書きフックのごく普通の形）や stdin 消費の下に置くとブロックが到達不能な死にコードになり、防壁が無言で失効する。単独設置時は shebang `#!/bin/sh` を先頭に、`exit 0` を末尾に付けた完全なファイルとして書く）(impl-fix: 旧規定「末尾に追記」は実測で防壁の無言失効を生んだため前置方式に改める):
 
 ```sh
 # >>> agents-kit pre-push >>> (install.sh が管理。手で編集しない)
-agents_kit_in="$(cat)"
-agents_kit_bad="$(printf '%s\n' "$agents_kit_in" | while read _lr _ls agents_kit_ref _rs; do
+agents_kit_tmp="${GIT_DIR:-.git}/agents-kit-prepush.$$"
+if ! cat > "$agents_kit_tmp"; then
+  echo "agents-kit: push 一覧(stdin)を退避できないため push を拒否した。" >&2
+  exit 1
+fi
+agents_kit_bad=""
+while read -r _lr _ls agents_kit_ref _rs; do
   case "$agents_kit_ref" in
-    "refs/heads/<MAIN>")  [ -z "$AGENTS_MERGE_TOKEN" ] && echo x ;;
-    "refs/heads/<STATE>") [ -z "$AGENTS_STATE_TOKEN" ] && echo x ;;
+    ("refs/heads/<MAIN>")  if [ -z "${AGENTS_MERGE_TOKEN:-}" ]; then agents_kit_bad=x; fi ;;
+    ("refs/heads/<STATE>") if [ -z "${AGENTS_STATE_TOKEN:-}" ]; then agents_kit_bad=x; fi ;;
   esac
-done)"
+done < "$agents_kit_tmp"
 if [ -n "$agents_kit_bad" ]; then
+  rm -f "$agents_kit_tmp"
   echo "agents-kit: 保護されたブランチへの直接 push を拒否した。これはあなたへの停止命令である。" >&2
   echo "  main に入れる唯一の方法: '.agents/bin/agents merge <slug>'（状態の変更は agents コマンドのみ）" >&2
   echo "  --no-verify や環境変数の手動設定による回避は禁止（重大な規律違反。操作は agent-state に記録され監査される）。" >&2
   exit 1
 fi
+exec < "$agents_kit_tmp"
+rm -f "$agents_kit_tmp"
 # <<< agents-kit pre-push <<<
 ```
 
-- while ループを `$(...)` 内に置くことで「パイプ先サブシェルの exit が親に効かない」POSIX の罠を回避している（判定はコマンド置換の出力で親に戻す）。実装はこの形を維持すること。
+- stdin（push される ref 一覧）は `${GIT_DIR:-.git}/agents-kit-prepush.$$` に**退避**してから判定し、通過時は `exec <` で後続（既存フック本体）へ**再供給**する（stdin を読む既存フックとも共存する。退避に失敗したら fail-closed で拒否）。判定の while はパイプでなく退避ファイルからのリダイレクト読みで回す（「パイプ先サブシェルの exit が親に効かない」POSIX の罠も同時に回避）。トークン参照は `${...:-}` 形式（`sh -u` な既存フック環境でも誤爆しない）。判定は if 文で書く（`[ ] &&` 形式は `sh -e` 下で偽時に errexit を誘発する）。実装はこの形を維持すること。(impl-fix)
+- ブロックは通過時に `exit` しない（フォールスルー）。単独設置ファイルの `exit 0` はブロック外＝ファイル末尾の 1 行として書く（前置設計との一貫性）。
 - トークンの説明コメントは意図的に書かない（変数名がコード上見えるのは判定に必要なため不可避だが、回避手順を自己文書化しない）。`agents merge` 手順 9 だけが `AGENTS_MERGE_TOKEN=1` を、WRITE-STATE と install.sh だけが `AGENTS_STATE_TOKEN=1` を子プロセス env に立てる。**どちらのトークン名もユーザー向け出力・PROTOCOL 本文には書かない**。
 - `agents done` の push（`agent/*`）は対象外なのでそのまま通る。main / state の削除 push（`:refs/heads/...`）も remote_ref 一致で拒否される。
-- このブロックは stdin（push される ref 一覧）を消費する。既存フックの後続行が stdin を読む場合は共存できないため、install.sh は追記時にその旨を警告表示する（pre-push で stdin を読む既存フックは稀）。
 - これは同一マシン・同一クローンに対する物理防壁。別クローン・別マシンは install.sh 再実行でカバーし、組織的に固めたい場合の GitHub branch protection は**推奨設定**として PROTOCOL.md 付録に記載する（前提にはしない。設定内容は §11 章 8 の通り正確に指定する — require PR 系は非互換）。
 
 ---
@@ -635,8 +643,8 @@ fi
 
 用法: `install.sh <target-repo-path> [--no-push]`（path 省略時 `.`）。bash スクリプト。**冪等**（全手順が検査後書込）。グローバル設定（`~/.claude`、`git config --global`、repo 外の hooksPath 先）には一切触れない。
 
-1. **検証と検出**: 対象が git repo か（`git -C T rev-parse --git-dir`）。remote（既存 config があればその `remote`、無ければ `origin`）が存在するか。無ければ exit 1 で次のレシピを表示: 「共有 remote が必要。ローカル専用なら: `git init --bare ../<repo>-coord.git && git -C <repo> remote add origin ../<repo>-coord.git`（push の FF 検査はローカル bare でも同一に働く）」。**default branch 検出**: `git ls-remote --symref <remote> HEAD` の `ref: refs/heads/<name>` を読む（検出不能なら `main` にフォールバックし警告）。既存 config があればその `main_branch` が優先。
-2. **事前 dirty 記録**: これから触る kit 管理外ファイル（`AGENTS.md` / `CLAUDE.md` / `.gitignore` / フック追記先が追跡ファイルの場合はそれ）について `git -C T status --porcelain -- <files>` を記録する（手順 8 の自動 push 可否判定に使う。**変更前に**取ること）。
+1. **検証と検出**: 対象が git repo か（`git -C T rev-parse --git-dir`）。remote（既存 config があればその `remote`、無ければ `origin`）が存在するか。無ければ exit 1 で次のレシピを表示: 「共有 remote が必要。ローカル専用なら: `git init --bare ../<repo>-coord.git && git -C <repo> remote add origin ../<repo>-coord.git`（push の FF 検査はローカル bare でも同一に働く）」。**default branch 検出**: `git ls-remote --symref <remote> HEAD` の `ref: refs/heads/<name>` を読む（検出不能なら `main` にフォールバックし警告）。既存 config があればその `main_branch` が優先。**ブランチ名の検証**: `main_branch` / `state_branch` はフックと JSON に埋め込むため文字集合を `[A-Za-z0-9._/-]` に限定し、外れる名前は赤字で exit 1（シェル/sed メタ文字で防壁が無言で壊れる名前を拒否する）。(impl-fix)
+2. **事前 dirty 記録**: これから触る kit 管理外ファイル（`AGENTS.md` / `CLAUDE.md` / `.gitignore` **とそれぞれの symlink 実体（repo 内の場合。realpath 解決は本手順より前＝一切の変更より前に行う）**、フック設置先が追跡ファイルの場合はそれ）について `git -C T status --porcelain -- <files>` を記録する（手順 8 の自動 push 可否判定に使う。**変更前に**取ること。字面のリンク名だけを見ると実体＝追跡ファイルの未コミット変更が素通りし、ブートストラップ push でユーザーの未公開内容が main に載る）。**ただし差分が kit 生成分のみのファイル**（内容から kit のポインタブロック / pre-push ブロック / .gitignore 追記 2 行を除いた残りが HEAD と一致。末尾改行差のみ許容）**は dirty とみなさない**（前回 run が生成した未追跡ファイルが「事前 dirty」と誤判定され、--no-push → 再実行の回復動線が永遠に push しなくなるのを防ぐ。ユーザー由来の変更は従来どおり dirty）。(impl-fix)
 3. `T/.agents/bin/agents` と `T/.agents/PROTOCOL.md` をキット同梱物から**常に上書き**配置（kit 管理ファイル。実行 bit 付与）。`T/.agents/config.json` が無ければ `{"test_cmd": null, "main_branch": "<検出値>"}` で生成（`merge_lock_ttl_min` の指針コメントを併記した README 的説明を出力に含める。JSON にコメントは書けない）。**既存なら触らない**。
 4. `T/AGENTS.md` と `T/CLAUDE.md` にポインタブロックを設置。マーカー `<!-- >>> agents-kit >>> -->` 〜 `<!-- <<< agents-kit <<< -->` が既にあれば置換、無ければ末尾に追記、ファイルが無ければ新規作成。**symlink 対応**: 対象が symlink なら実体パスに対して追記/置換し、リンクは保持する（tmp に書いて mv で置換する実装は symlink を実体化させるため禁止）。CLAUDE.md と AGENTS.md が互いに symlink の場合は実体側だけを 1 回処理する。本文:
 
@@ -651,15 +659,15 @@ fi
 
 5. `T/.gitignore` に行 `/.worktrees/` と `/.agents/config.json` が無ければ追記（行単位の存在検査で冪等）。
 6. **フック設置**（§9）: `HP = git -C T config --get core.hooksPath`。
-   - HP 未設定 → 対象 = `COMMON_GITDIR/hooks/pre-push`。無ければ完全ファイルとして設置＋実行 bit。自マーカーがあれば置換。他人のフックが既にあればマーカーブロックを末尾に追記（stdin 消費の注意を表示）。
-   - HP が repo 内（T 相対で解決して T 配下）→ `<HP>/pre-push` に同じ方針でブロック追記/置換（無ければ作成＋実行 bit）。追記先が**追跡ファイル**（husky の `.husky/pre-push` 等）なら手順 8 の push 対象に含める。
-   - HP が repo 外（グローバル hooks 等）→ **書かない**。赤字警告と手動追記用ブロックを表示（sync が毎回警告し続けることも明記）。
+   - HP 未設定 → 対象 = `COMMON_GITDIR/hooks/pre-push`。無ければ完全ファイルとして設置＋実行 bit。既存ファイルがあれば（自マーカーの有無を問わず）**旧ブロックを除去した上で新ブロックを先頭（shebang 直後）に前置**（§9。再 install で「shebang → exit 0 → ブロック」の到達不能な並びを作らない）。(impl-fix)
+   - HP が repo 内（T 相対で解決して T 配下）→ `<HP>/pre-push` に同じ方針でブロック前置/置換（無ければ作成＋実行 bit）。設置先が**追跡ファイル**（husky の `.husky/pre-push` 等）なら手順 8 の push 対象に含める。
+   - HP が repo 外（グローバル hooks 等）→ **書かない**。赤字警告と手動**前置**用ブロックを表示（先頭＝shebang 直後に置くことと、sync が毎回警告し続けることも明記）。(impl-fix)
 7. **`agent-state` 初期化**: `git -C T ls-remote <remote> refs/heads/<state>` が空なら、plumbing で初期コミットを作成し push:
    `B=$(printf '0\n' | git hash-object -w --stdin)`、README も同様 → `TREE=$(printf '100644 blob %s\tcounter\n100644 blob %s\tREADME.md\n' "$B" "$R" | git mktree)` → `C=$(git -c user.name=agents-kit -c user.email=agents-kit@local commit-tree $TREE -m 'agents-kit: state root')`（**親なし** = orphan）→ `AGENTS_STATE_TOKEN=1 git push <remote> $C:refs/heads/<state>`。
    **push 失敗は §5.3 で分類**: CAS 系パターン → 誰かが先に作った＝成功扱い。それ以外（認証・接続等）→ stderr 全文を表示して exit 1（「成功」と偽らない）。最後に `ls-remote` で `refs/heads/<state>` の存在を再確認してから成功を宣言する（無限空振りループの根絶）。
 8. **ブートストラップ push**（.agents 一式を main に載せる。導入デッドロックの解消。`--no-push` 時はスキップして内容確認を促し、「push は install.sh 再実行で行え」と表示）:
-   a. fetch main（`refs/remotes/<remote>/<main>` 不在＝unborn は空ツリー扱い）。remote 版 `.agents/bin/agents` の blob が今回配置した実体と同一 hash なら**スキップ**（冪等。kit 更新時は差分ありとして進む）。
-   b. 手順 2 の事前 dirty が非空 → 自動 push せず表示して手順 9 へ: 「<files> に既存の未コミット変更があるため自動 push しない。内容を確認して commit した後、install.sh を再実行せよ（install.sh が push する）」。ユーザーの未コミット変更を黙って main に載せない。
+   a. fetch main（`refs/remotes/<remote>/<main>` 不在＝unborn は空ツリー扱い）。remote 版 `.agents/bin/agents` の blob が今回配置した実体と同一 hash なら**スキップ**（冪等。kit 更新時は差分ありとして進む）。**この判定は b（および --no-push 分岐）より先に行う**（逆順だとブートストラップ済み repo で「commit して再実行せよ」という誤った行動指示を出す）。(impl-fix)
+   b. 手順 2 の事前 dirty が非空 → 自動 push せず表示して手順 9 へ: 「<files> に既存の未コミット変更があるため自動 push しない。内容を確認して commit した後、install.sh を再実行せよ（install.sh が push する）」。ユーザーの未コミット変更を黙って main に載せない（kit 生成分のみの差分は手順 2 で除外済み — kit 自身の生成物で自動 push を止め続けない）。
    c. 一時 index（`GIT_INDEX_FILE`）で `read-tree <tip>^{tree}`（unborn は `read-tree --empty`）→ 対象ファイルを add（`.agents/bin/agents`, `.agents/PROTOCOL.md`, `AGENTS.md`, `CLAUDE.md`（symlink は実体側）, `.gitignore`, 手順 6 で追記した追跡フックファイル。**config.json は含めない**＝ignore 済み・クローンローカル）→ `write-tree` → `commit-tree -p <tip>`（unborn は親なし）`-m "agents-kit: install"` → `AGENTS_MERGE_TOKEN=1 git push <remote> COMMIT:refs/heads/<main>`（トークンは内部で立てるだけで**表示しない**）。
    d. push 失敗の分類は §5.3: CAS 系 → fetch し直して c を再構築（≤5 回）。それ以外（認証・branch protection の PR 必須設定等）→ stderr 全文と手動レシピを表示して exit 1: 「ブランチを切って通常の PR/マージ手順で上記ファイルを main に入れ、その後 install.sh を再実行して検証せよ」。
    これにより、導入直後の「git push origin main が自前フックに拒否され、回避手段を初日に学習する」経路は存在しなくなる。ユーザー/AI が手で main に push する正当な場面は導入フローに一切残らない。
@@ -731,7 +739,7 @@ fi
 
 ## 14. 実装ノート
 
-- 定数（スクリプト先頭に集約）: `CAS_MAX=10`, `CAS_SLEEP=uniform(0.2,1.0)+0.1*attempt`, `FETCH_RETRY=5`, `FETCH_SLEEP=uniform(0.1,0.5)`, `MERGE_RESTART_MAX=2`（初回+再走 2）, `PUSH_CAS_PATTERNS`（§5.2 の 7 パターン。push 失敗分類の唯一の定義とし、WRITE-STATE / merge 手順 9 / install.sh から共用）, `RECOVERY_SCAN=1000`（4b の first-parent 走査上限）, `SYM_FILE_CAP=1_000_000` bytes, `DIRECTIVE_TAIL=10`, `REFRESH_FRACTION=claim_ttl/4`, `GH_TIMEOUT=3s`, `TEST_LOG_TAIL=50` 行（失敗表示用。実行自体は inherit で流す）, `REMINDER`（§8.0 の固定リマインド行の文字列）。
+- 定数（スクリプト先頭に集約）: `CAS_MAX=10`, `CAS_SLEEP=uniform(0.2,1.0)+0.1*attempt`, `FETCH_RETRY=5`, `FETCH_SLEEP=uniform(0.1,0.5)`, `MERGE_RESTART_MAX=2`（初回+再走 2）, `PUSH_CAS_PATTERNS`（§5.2 の 7 パターン。push 失敗分類の唯一の定義とし、WRITE-STATE / merge 手順 9 / install.sh から共用）, `RECOVERY_SCAN=1000`（4b の first-parent 走査上限）, `SYM_FILE_CAP=1_000_000` bytes, `DIRECTIVE_TAIL=10`, `REFRESH_FRACTION=claim_ttl/4`, `GH_TIMEOUT=3s`, `TEST_LOG_TAIL=50` 行（失敗表示用。実行自体はチャンク単位の無遅延 tee で流す。§8.0。(impl-fix)）, `REMINDER`（§8.0 の固定リマインド行の文字列）。
 - すべての git 呼び出しは `subprocess.run([...], capture_output=..., env={**os.environ, "LC_ALL": "C", "LANG": "C"})`。トークン（`AGENTS_STATE_TOKEN` / `AGENTS_MERGE_TOKEN`）は該当 push の env にだけ足す。シェル経由は build/test の `sh -c` のみ。
 - `read-tree` の引数は `<tip>^{tree}`（リテラル波括弧）。zsh 等の展開問題はスクリプト内 exec なので無関係。
 - WRITE-STATE の一時 index 置き場 `COMMON_GITDIR/agents-tmp/` は初回に mkdir -p。プロセス異常終了で残ったファイルは起動時に 24h より古いものを黙って削除（軽量 GC。これ以外の自動 GC はしない。孤児 worktree は sync の一覧表示＝人間判断に委ねる）。
