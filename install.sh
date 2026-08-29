@@ -425,6 +425,55 @@ EOF
   return 1
 }
 
+reconcile_checkout() {  # 手順8.5（§10）: ブートストラップ commit が remote main に載った後、
+  # 導入クローンの checkout を FF で追いつかせる。これをしないと直後の git pull が
+  # 「未追跡の .agents 等に上書きされる」で拒否される（導入初日に必ず踏む紙傷）。
+  # 条件を全て満たす時だけ動き、満たさなければ 1 行の案内のみ（ユーザーの状態を壊さない）。
+  local TIP cur f blob removed=""
+  g fetch --quiet "$REMOTE" "+refs/heads/$MAIN:refs/remotes/$REMOTE/$MAIN" 2>/dev/null
+  TIP="$(g rev-parse -q --verify "refs/remotes/$REMOTE/$MAIN" 2>/dev/null || true)"
+  [ -n "$TIP" ] || return 0
+  cur="$(g symbolic-ref --quiet --short HEAD || true)"
+  [ "$cur" = "$MAIN" ] || return 0
+  [ "$(g rev-parse HEAD 2>/dev/null)" = "$TIP" ] && return 0
+  if ! g merge-base --is-ancestor HEAD "$TIP" 2>/dev/null; then
+    echo "注意: ローカル $MAIN が remote と分岐している。自動では進めない（git pull --rebase 等で手動解消）"
+    return 0
+  fi
+  if [ -n "$(g status --porcelain -uno)" ]; then
+    echo "注意: 追跡ファイルに未コミット変更があるため checkout を自動で進めない。commit 後の git pull が .agents 等の未追跡ファイルに阻まれたら、それらを消してから pull せよ（内容は commit 済みで失われない）"
+    return 0
+  fi
+  restore_removed() {
+    local r
+    while IFS= read -r r; do
+      [ -n "$r" ] && g cat-file blob "$TIP:$r" > "$T/$r"
+    done <<< "$removed"
+  }
+  # FF を阻む未追跡ファイルのうち「remote 版と内容同一」のものだけを消す（FF 後に追跡状態で復活する）
+  while IFS= read -r -d '' f; do
+    if [ -e "$T/$f" ] && ! g ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+      blob="$(g rev-parse -q --verify "$TIP:$f" 2>/dev/null || true)"
+      if [ -n "$blob" ] && [ "$(g hash-object "$T/$f")" = "$blob" ]; then
+        rm -f "$T/$f"
+        removed="$removed$f
+"
+      else
+        restore_removed
+        echo "注意: 未追跡の $f が remote 版と内容が異なるため checkout の自動前進を中止（git pull を手で行え）"
+        return 0
+      fi
+    fi
+  done < <(g diff --name-only -z HEAD "$TIP")
+  if g merge --ff-only "$TIP" >/dev/null 2>&1; then
+    echo "ローカル checkout を $MAIN 最新へ前進させた（この後の git pull は不要）"
+  else
+    restore_removed
+    echo "注意: checkout の自動前進に失敗した。git pull を手で行え（.agents 等の未追跡ファイルに阻まれたら消してよい。内容は commit 済み）"
+  fi
+  return 0
+}
+
 # 判定順は §10 手順8 のとおり a（冪等スキップ）→ b（事前 dirty）。逆にすると
 # ブートストラップ済み repo で「commit して再実行せよ」という誤った行動指示を出す。
 bootstrap_identical() {
@@ -456,6 +505,11 @@ else
     echo "エラー: ブートストラップ push が CAS 敗北を 5 回超えた。少し待って install.sh を再実行せよ" >&2
     exit 1
   fi
+fi
+
+# 手順8.5: ブートストラップ内容が remote main に載っている場合のみ、導入クローンの checkout を追いつかせる
+if [ -z "$SKIPPED_PUSH_REASON" ]; then
+  reconcile_checkout
 fi
 
 # ---------------------------------------------------------------------------
