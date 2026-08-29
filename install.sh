@@ -524,6 +524,9 @@ else
 fi
 cat <<EOF
       {"main_branch": "$MAIN", "test_cmd": "npm test"}   # pytest なら "pytest -q"、テスト無し repo は "true" と明示
+    設定後、repo ルートで一度 sh -c '<test_cmd>' を実行し素で通ることを確認せよ
+    （main の時点で通らない test_cmd は全セッションの done/merge を止める）。
+    言語の生成物（__pycache__ 等）は repo の .gitignore に入れておくこと（残ると done が dirty で停止する）。
     merge_lock_ttl_min（既定 30 分）はフルテスト所要時間の 2 倍以上に設定すること
     （ハートビートがあるため下回っても安全性は壊れないが、警告が増える）。
     config.json はクローンローカル＝コミットされない。別クローンでは install.sh 再実行＋test_cmd 再設定。
