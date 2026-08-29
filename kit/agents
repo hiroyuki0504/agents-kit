@@ -1,0 +1,1881 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""agents — マルチAIセッション協調キット CLI（agents-kit v1）。
+
+SPEC.md 完全準拠の単一ファイル実装。標準ライブラリのみ（python 3.9+ / git 2.30+）。
+調整媒体は origin 上の orphan ブランチ agent-state。全状態変更は WRITE-STATE（CAS）を通る。
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import random
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ============================================================================
+# 定数（SPEC §14。スクリプト先頭に集約）
+# ============================================================================
+
+CAS_MAX = 10                 # WRITE-STATE の CAS リトライ上限
+FETCH_RETRY = 5              # fetch / worktree add / remove のロック競合リトライ上限
+MERGE_RESTART_MAX = 2        # merge 手順9 CAS 敗北の再走上限（初回 + 再走2）
+RECOVERY_SCAN = 1000         # 手順4b first-parent 走査上限
+SYM_FILE_CAP = 1_000_000     # シンボル検査のファイルサイズ上限（bytes）
+DIRECTIVE_TAIL = 10          # sync の directive 表示件数
+GH_TIMEOUT = 3               # gh 呼び出しタイムアウト（秒）
+TEST_LOG_TAIL = 50           # テスト失敗時に再掲する末尾行数（実行自体は流しながら表示）
+
+# push 失敗分類の唯一の定義（§5.2/§5.3）。WRITE-STATE / merge 手順9 が共用し、
+# install.sh は bash のため同一パターン列を移植している（install.sh 内コメント参照。
+# 変更時は install.sh の AGENTS_KIT_CAS_PATTERNS も同時に更新すること）。
+PUSH_CAS_PATTERNS = [
+    r"\[rejected\]", r"non-fast-forward", r"fetch first",
+    r"\[remote rejected\]", r"incorrect old value",
+    r"failed to update ref", r"cannot lock ref",
+]
+# 後段4つは「advertise〜ref更新の窓に他pushが着地した」CAS本命レースの実測パターン
+# （git 2.53.0: "! [remote rejected] ... (incorrect old value provided)"）。
+
+REMINDER = ('※ ユーザーから受けた口頭指示で未記録のものは無いか? '
+            'あれば次の行動より先に: agents directive "<指示の原文>"')
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+RESERVED_SLUGS = {"merge", "state", "evict"}
+
+CONFIG_DEFAULTS = {
+    "test_cmd": None,
+    "build_cmd": None,
+    "remote": "origin",
+    "main_branch": "main",
+    "state_branch": "agent-state",
+    "worktree_root": ".worktrees",
+    "claim_ttl_hours": 24,
+    "merge_lock_ttl_min": 30,
+    "pr": "auto",
+}
+
+FETCH_ADVICE = (
+    "config.json の `remote` / `main_branch` / `state_branch` が実 repo と一致しているか確認せよ。"
+    "既定ブランチが main でない repo は install.sh が検出するが、"
+    "手で config を変えた場合は install.sh を再実行せよ")
+
+ROLLBACK_MSG = (
+    "agent-state が巻き戻されている（force push の痕跡）。seq の一意性が保証できないため\n"
+    "全操作を停止した。ユーザーに報告せよ。ユーザー自身による意図的なリセットの場合のみ、\n"
+    "各クローンで git update-ref -d refs/remotes/{R}/{S} を実行してから再実行")
+
+HOOK_MARKER = ">>> agents-kit pre-push >>>"
+HOOK_MARKER_END = "<<< agents-kit pre-push <<<"
+
+# 言語別シンボル正規表現表（§7.1。拡張はここに行を足すだけ）
+_SYM_SPECS = [
+    ({".py"},
+     r"^[ \t]*(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)|^[ \t]*class[ \t]+([A-Za-z_]\w*)", 0),
+    ({".js", ".jsx", ".ts", ".tsx", ".mjs"},
+     r"^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?function[ \t*]+([A-Za-z_$][\w$]*)"
+     r"|^[ \t]*(?:export[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)"
+     r"|^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*=", 0),
+    ({".go"},
+     r"^func[ \t]+(?:\([^)]*\)[ \t]*)?([A-Za-z_]\w*)|^type[ \t]+([A-Za-z_]\w*)", 0),
+    ({".rs"},
+     r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:async[ \t]+)?(?:fn|struct|enum|trait|mod)[ \t]+([A-Za-z_]\w*)", 0),
+    ({".java", ".kt", ".scala"},
+     r"^[ \t]*(?:(?:public|private|protected|internal|open|final|abstract|static|sealed|data|suspend|override)[ \t]+)*"
+     r"(?:class|interface|enum|object|fun|record)[ \t]+([A-Za-z_]\w*)", 0),
+    ({".swift"},
+     r"^[ \t]*(?:(?:public|private|internal|open|final|static)[ \t]+)*"
+     r"(?:func|class|struct|enum|protocol|extension)[ \t]+([A-Za-z_]\w*)", 0),
+    ({".rb"},
+     r"^[ \t]*def[ \t]+(?:self\.)?([A-Za-z_]\w*[?!=]?)|^[ \t]*(?:class|module)[ \t]+([A-Z]\w*)", 0),
+    ({".sh", ".bash", ".zsh"},
+     r"^[ \t]*(?:function[ \t]+)?([A-Za-z_]\w*)[ \t]*\(\)", 0),
+    ({".vb"},
+     r"^[ \t]*(?:(?:Public|Private|Friend|Protected|Shared|Overrides|Overloads)[ \t]+)*"
+     r"(?:Sub|Function|Class|Module|Property)[ \t]+([A-Za-z_]\w*)", re.IGNORECASE),
+]
+SYMBOL_TABLE = {}
+for _exts, _rx, _flags in _SYM_SPECS:
+    _c = re.compile(_rx, re.MULTILINE | _flags)
+    for _e in _exts:
+        SYMBOL_TABLE[_e] = _c
+
+
+# ============================================================================
+# 実行コンテキスト・例外
+# ============================================================================
+
+class AgentsExit(Exception):
+    """終了コード付き中断。main() が捕捉して表示・exit する。"""
+    def __init__(self, code, msg=None):
+        super().__init__(msg or "")
+        self.code = code
+        self.msg = msg
+
+
+class Ctx:
+    root = None            # 主 clone のルート（絶対 Path）
+    common_gitdir = None   # 共有 gitdir（絶対 Path）
+    cfg = None             # config dict（既定値マージ済み）
+    json_mode = False
+    cmd = None
+
+
+CTX = Ctx()
+
+
+def R():
+    return CTX.cfg["remote"]
+
+
+def S():
+    return CTX.cfg["state_branch"]
+
+
+def M():
+    return CTX.cfg["main_branch"]
+
+
+def fmt_d(n):
+    return "d%05d" % n
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def age_minutes(iso):
+    t = parse_iso(iso)
+    if t is None:
+        return None
+    return (datetime.now(timezone.utc) - t).total_seconds() / 60.0
+
+
+def fmt_age(iso):
+    m = age_minutes(iso)
+    if m is None:
+        return "?"
+    if m < 1:
+        return "たった今"
+    if m < 60:
+        return "%d分前" % int(m)
+    if m < 1440:
+        return "%.1f時間前" % (m / 60)
+    return "%.1f日前" % (m / 1440)
+
+
+def state_dumps(obj):
+    # 決定的なバイト列（§4.1）。全 state ファイル共通。
+    return (json.dumps(obj, ensure_ascii=False, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+# ============================================================================
+# git サブプロセス（全呼び出し LC_ALL=C LANG=C。§3.1/§14）
+# ============================================================================
+
+def git(args, cwd=None, env_extra=None, input_bytes=None):
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd or CTX.root), env=env,
+        input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _t(b):
+    return b.decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) else str(b)
+
+
+def rev_parse_q(ref, cwd=None):
+    r = git(["rev-parse", "-q", "--verify", ref], cwd=cwd)
+    return _t(r.stdout).strip() if r.returncode == 0 else None
+
+
+def is_ancestor(a, b):
+    return git(["merge-base", "--is-ancestor", a, b]).returncode == 0
+
+
+def is_cas_stderr(stderr_text):
+    return any(re.search(p, stderr_text) for p in PUSH_CAS_PATTERNS)
+
+
+def _lock_retryable(stderr_text):
+    # §3.1: ref ロック競合パターン
+    s = stderr_text
+    return ("cannot lock ref" in s or "could not lock" in s
+            or ("Unable to create" in s and ".lock" in s)
+            or "unable to update local ref" in s)
+
+
+def fetch_branch(branch, allow_missing=False, state_missing_exit3=False):
+    """明示 refspec fetch（§3.1 リトライ規約）。allow_missing: remote ref 不在を無視。"""
+    last = ""
+    for _ in range(FETCH_RETRY):
+        r = git(["fetch", "--quiet", R(), "+refs/heads/%s:refs/remotes/%s/%s" % (branch, R(), branch)])
+        if r.returncode == 0:
+            return True
+        last = _t(r.stderr)
+        if _lock_retryable(last):
+            time.sleep(random.uniform(0.1, 0.5))
+            continue
+        if "couldn't find remote ref" in last:
+            if allow_missing:
+                return False
+            if state_missing_exit3:
+                raise AgentsExit(3, "agent-state が無い。install.sh を実行せよ")
+        raise AgentsExit(6, last.rstrip() + "\n" + FETCH_ADVICE)
+    raise AgentsExit(6, "fetch リトライ上限（ref ロック競合が解消しない）。最後の stderr:\n" + last)
+
+
+def fetch_main():
+    fetch_branch(M())
+
+
+def worktree_retry(args, cleanup=None):
+    """worktree add / remove を §3.1 のリトライ規約で実行。"""
+    last = ""
+    for i in range(FETCH_RETRY):
+        if i > 0 and cleanup:
+            cleanup()
+        r = git(args)
+        if r.returncode == 0:
+            return r
+        last = _t(r.stderr)
+        if _lock_retryable(last) or "already exists" in last:
+            time.sleep(random.uniform(0.1, 0.5))
+            continue
+        raise AgentsExit(6, "git %s が失敗:\n%s" % (" ".join(args[:2]), last))
+    raise AgentsExit(6, "worktree 操作のリトライ上限。最後の stderr:\n" + last)
+
+
+# ============================================================================
+# 起動時共通処理（§8.0）
+# ============================================================================
+
+def resolve_context():
+    r = git_nocwd(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if r.returncode != 0:
+        raise AgentsExit(3, "git リポジトリの中で実行せよ（git repo 外か bare）")
+    common = Path(_t(r.stdout).strip())
+    if common.name != ".git":
+        raise AgentsExit(3, "bare リポジトリでは実行できない（git-common-dir が .git でない）")
+    CTX.common_gitdir = common
+    CTX.root = common.parent
+
+    # config: <現worktreeのtoplevel>/.agents/config.json → ROOT/.agents/config.json
+    top = None
+    rt = git_nocwd(["rev-parse", "--show-toplevel"])
+    if rt.returncode == 0:
+        top = Path(_t(rt.stdout).strip())
+    cfg_path = None
+    for base in ([top] if top else []) + [CTX.root]:
+        p = base / ".agents" / "config.json"
+        if p.is_file():
+            cfg_path = p
+            break
+    if cfg_path is None:
+        raise AgentsExit(3, ".agents/config.json が無い。install.sh を実行せよ")
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise AgentsExit(3, "config.json のパースに失敗: %s (%s)" % (cfg_path, e))
+    if not isinstance(raw, dict):
+        raise AgentsExit(3, "config.json はオブジェクトであるべき: %s" % cfg_path)
+    unknown = [k for k in raw if k not in CONFIG_DEFAULTS]
+    if unknown:
+        print("警告: config.json に未知のキー: %s" % ", ".join(sorted(unknown)), file=sys.stderr)
+    cfg = dict(CONFIG_DEFAULTS)
+    cfg.update({k: v for k, v in raw.items() if k in CONFIG_DEFAULTS})
+    CTX.cfg = cfg
+
+    # 一時 index 置き場の準備と軽量 GC（24h より古い残骸を黙って削除。§14）
+    tmpdir = CTX.common_gitdir / "agents-tmp"
+    try:
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 24 * 3600
+        for f in tmpdir.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def git_nocwd(args):
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return subprocess.run(["git"] + args, cwd=os.getcwd(), env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def worktree_root_abs():
+    wr = CTX.cfg["worktree_root"]
+    p = Path(wr)
+    return p if p.is_absolute() else (CTX.root / wr)
+
+
+def self_ident():
+    """自 worktree の agents.json（{"slug","agent","branch"}）。無ければ None（claim worktree 外）。"""
+    r = git_nocwd(["rev-parse", "--absolute-git-dir"])
+    if r.returncode != 0:
+        return None
+    p = Path(_t(r.stdout).strip()) / "agents.json"
+    if not p.is_file():
+        return None
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if all(k in obj for k in ("slug", "agent", "branch")):
+            return obj
+    except Exception:
+        pass
+    return None
+
+
+def cwd_toplevel():
+    r = git_nocwd(["rev-parse", "--show-toplevel"])
+    if r.returncode != 0:
+        raise AgentsExit(3, "作業ツリーの中で実行せよ")
+    return Path(_t(r.stdout).strip())
+
+
+# ============================================================================
+# READ-STATE / WRITE-STATE（§5.1 / §5.2）
+# ============================================================================
+
+class State:
+    def __init__(self, tip, names, counter, directives, claims, lock):
+        self.tip = tip
+        self.names = names
+        self.counter = counter
+        self.directives = directives   # {seq:int -> obj}
+        self.claims = claims           # {slug -> obj}
+        self.lock = lock               # obj | None
+        self.extra = {}                # precheck が mutate に渡す作業領域
+
+    @property
+    def maxd(self):
+        return max(self.directives.keys(), default=0)
+
+
+def cat_blob(rev, path):
+    r = git(["cat-file", "blob", "%s:%s" % (rev, path)])
+    return r.stdout if r.returncode == 0 else None
+
+
+def load_state_from_tip(tip):
+    r = git(["ls-tree", "-r", "--name-only", tip])
+    if r.returncode != 0:
+        raise AgentsExit(6, "ls-tree 失敗: " + _t(r.stderr))
+    names = _t(r.stdout).split("\n")
+    names = [n for n in names if n]
+    counter = 0
+    if "counter" in names:
+        raw = cat_blob(tip, "counter")
+        try:
+            counter = int(_t(raw).strip() or "0")
+        except Exception:
+            raise AgentsExit(6, "state ファイルのパースに失敗: counter")
+    directives, claims, lock = {}, {}, None
+    for n in names:
+        if n.startswith("directives/") and n.endswith(".json"):
+            obj = _load_json_blob(tip, n)
+            directives[int(obj["seq"])] = obj
+        elif n.startswith("claims/") and n.endswith(".json"):
+            obj = _load_json_blob(tip, n)
+            claims[obj.get("slug") or Path(n).stem] = obj
+        elif n == "locks/merge.json":
+            lock = _load_json_blob(tip, n)
+    return State(tip, names, counter, directives, claims, lock)
+
+
+def _load_json_blob(tip, name):
+    raw = cat_blob(tip, name)
+    try:
+        return json.loads(_t(raw))
+    except Exception:
+        raise AgentsExit(6, "state ファイルのパースに失敗: " + name)
+
+
+def read_state():
+    """§5.1 READ-STATE（fetch + 巻き戻り検知 + 全読込）。"""
+    old = rev_parse_q("refs/remotes/%s/%s" % (R(), S()))
+    fetch_branch(S(), state_missing_exit3=True)
+    tip = rev_parse_q("refs/remotes/%s/%s" % (R(), S()))
+    if tip is None:
+        raise AgentsExit(3, "agent-state が無い。install.sh を実行せよ")
+    if old is not None and not is_ancestor(old, tip):
+        raise AgentsExit(6, ROLLBACK_MSG.format(R=R(), S=S()))
+    return load_state_from_tip(tip)
+
+
+def _apply_commit(tip, changes, msg):
+    """一時 index の plumbing で tip の上に 1 コミットを作る（主 index/HEAD/作業ツリーに触れない）。"""
+    tmpidx = CTX.common_gitdir / "agents-tmp" / ("idx-%d-%s" % (os.getpid(), secrets.token_hex(4)))
+    env = {"GIT_INDEX_FILE": str(tmpidx)}
+    try:
+        r = git(["read-tree", "%s^{tree}" % tip], env_extra=env)
+        if r.returncode != 0:
+            raise AgentsExit(6, "read-tree 失敗: " + _t(r.stderr))
+        for ch in changes:
+            if ch[0] == "put":
+                _, path, content = ch
+                rb = git(["hash-object", "-w", "--stdin"], env_extra=env, input_bytes=content)
+                if rb.returncode != 0:
+                    raise AgentsExit(6, "hash-object 失敗: " + _t(rb.stderr))
+                blob = _t(rb.stdout).strip()
+                ru = git(["update-index", "--add", "--cacheinfo", "100644,%s,%s" % (blob, path)],
+                         env_extra=env)
+                if ru.returncode != 0:
+                    raise AgentsExit(6, "update-index 失敗: " + _t(ru.stderr))
+            elif ch[0] == "del":
+                _, path = ch
+                ru = git(["update-index", "--force-remove", path], env_extra=env)
+                if ru.returncode != 0:
+                    raise AgentsExit(6, "update-index --force-remove 失敗: " + _t(ru.stderr))
+        rt = git(["write-tree"], env_extra=env)
+        if rt.returncode != 0:
+            raise AgentsExit(6, "write-tree 失敗: " + _t(rt.stderr))
+        tree = _t(rt.stdout).strip()
+        rc = git(["-c", "user.name=agents-kit", "-c", "user.email=agents-kit@local",
+                  "commit-tree", tree, "-p", tip, "-m", msg])
+        if rc.returncode != 0:
+            raise AgentsExit(6, "commit-tree 失敗: " + _t(rc.stderr))
+        return _t(rc.stdout).strip()
+    finally:
+        try:
+            tmpidx.unlink()
+        except OSError:
+            pass
+
+
+def write_state(precheck, mutate, msg, on_precheck_fail="exit"):
+    """§5.2 WRITE-STATE（CAS）。全状態変更はこの 1 関数を通る。
+
+    precheck(st) -> None | (code:int, msg:str)。前提評価は必ずループ内（I-CAS）。
+    mutate(st)   -> [("put", path, bytes) | ("del", path)]。空/None は書き込み不要（no-op）。
+    on_precheck_fail="skip" はハートビートと UNLOCK 専用（§5.2）。他は必ず exit。
+    ローカル refs/heads/<state> は決して作らない（SHA:refspec push のみ）。
+    """
+    last_stderr = ""
+    for attempt in range(CAS_MAX):
+        st = read_state()                    # 毎回 fetch + 巻き戻り検知
+        err = precheck(st) if precheck else None
+        if err:
+            if on_precheck_fail == "skip":
+                print("警告: " + err[1])
+                return None
+            raise AgentsExit(err[0], err[1])
+        changes = mutate(st)
+        if not changes:
+            return None                      # 書くものが無い（evict の全対象消滅など）
+        msg_val = msg() if callable(msg) else msg   # seq 依存の msg（directive/evict）は mutate 後に確定
+        commit = _apply_commit(st.tip, changes, msg_val)
+        rp = git(["push", "--quiet", R(), "%s:refs/heads/%s" % (commit, S())],
+                 env_extra={"AGENTS_STATE_TOKEN": "1"})
+        if rp.returncode == 0:
+            return commit
+        last_stderr = _t(rp.stderr)
+        if is_cas_stderr(last_stderr):
+            time.sleep(random.uniform(0.2, 1.0) + 0.1 * attempt)  # CAS 敗北 = 正常イベント
+            continue
+        # 致命系の前に「適用済みだが応答が届かなかった」を 1 回だけ検査（書込の冪等化。§5.2）
+        try:
+            fetch_branch(S())
+            tip2 = rev_parse_q("refs/remotes/%s/%s" % (R(), S()))
+            if tip2 and is_ancestor(commit, tip2):
+                return commit
+        except AgentsExit:
+            pass
+        raise AgentsExit(6, last_stderr)
+    raise AgentsExit(5, "CAS リトライ上限。少し待って再実行せよ。最後の stderr:\n" + last_stderr)
+
+
+# ============================================================================
+# パス重複判定（§6）
+# ============================================================================
+
+_WILD = set("*?[")
+
+
+def _kind(p):
+    return "pattern" if any(c in _WILD for c in p) else "literal"
+
+
+def _foot(pat):
+    idx = len(pat)
+    for i, c in enumerate(pat):
+        if c in _WILD:
+            idx = i
+            break
+    pre = pat[:idx]
+    j = pre.rfind("/")
+    return pre[:j + 1] if j >= 0 else ""
+
+
+def _overlap1(a, b, files):
+    ka, kb = _kind(a), _kind(b)
+    if ka == "literal" and kb == "literal":
+        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+    if ka == "literal" or kb == "literal":
+        lit, pat = (a, b) if ka == "literal" else (b, a)
+        return fnmatch.fnmatchcase(lit, pat) or lit.startswith(_foot(pat))
+    fa, fb = _foot(a), _foot(b)
+    if fa.startswith(fb) or fb.startswith(fa):
+        return True  # foot "" のパターンは全体と交差扱い（安全側）
+    ma = {f for f in files if fnmatch.fnmatchcase(f, a)}
+    mb = {f for f in files if fnmatch.fnmatchcase(f, b)}
+    return bool(ma & mb)
+
+
+def find_overlap(paths_a, paths_b, files):
+    for a in paths_a:
+        for b in paths_b:
+            if _overlap1(a, b, files):
+                return (a, b)
+    return None
+
+
+def ls_tree_files(rev):
+    r = git(["ls-tree", "-r", "--name-only", rev])
+    if r.returncode != 0:
+        raise AgentsExit(6, "ls-tree 失敗: " + _t(r.stderr))
+    return [n for n in _t(r.stdout).split("\n") if n]
+
+
+# ============================================================================
+# シンボル消失チェック（§7）
+# ============================================================================
+
+def _sym_set(rev, path, rx):
+    raw = cat_blob(rev, path)
+    if raw is None:
+        return set()
+    text = raw.decode("utf-8", "replace")
+    out = set()
+    for m in rx.finditer(text):
+        for g in m.groups():
+            if g is not None:
+                out.add(g)
+                break
+    return out
+
+
+def _blob_size(rev, path):
+    r = git(["cat-file", "-s", "%s:%s" % (rev, path)])
+    if r.returncode != 0:
+        return None  # 欠如
+    try:
+        return int(_t(r.stdout).strip())
+    except Exception:
+        return None
+
+
+def symbol_check(m_sha, br, res):
+    """戻り値: (violations:[(file,symbol,kind)], unchecked:[(file,理由)])。"""
+    rb = git(["merge-base", m_sha, br])
+    if rb.returncode != 0:
+        raise AgentsExit(6, "merge-base 失敗: " + _t(rb.stderr))
+    b0 = _t(rb.stdout).strip()
+    rd = git(["diff", "--no-renames", "--name-only", b0, br])
+    if rd.returncode != 0:
+        raise AgentsExit(6, "diff 失敗: " + _t(rd.stderr))
+    changed = [n for n in _t(rd.stdout).split("\n") if n]
+    violations, unchecked = [], []
+    for f in changed:
+        ext = Path(f).suffix.lower()
+        rx = SYMBOL_TABLE.get(ext)
+        if rx is None:
+            unchecked.append((f, "拡張子が検査表に無い"))
+            continue
+        too_big = False
+        for rev in (b0, br, m_sha, res):
+            sz = _blob_size(rev, f)
+            if sz is not None and sz > SYM_FILE_CAP:
+                too_big = True
+                break
+        if too_big:
+            unchecked.append((f, "1MB 超"))
+            continue
+        s_b0 = _sym_set(b0, f, rx)
+        s_br = _sym_set(br, f, rx)
+        s_m = _sym_set(m_sha, f, rx)
+        s_res = _sym_set(res, f, rx)
+        added = s_br - s_b0
+        lost_added = added - s_res
+        removed_by_br = s_b0 - s_br
+        lost_main = (s_m - removed_by_br) - s_res
+        for s in sorted(lost_added):
+            violations.append((f, s, "added"))
+        for s in sorted(lost_main):
+            violations.append((f, s, "main"))
+    return violations, unchecked
+
+
+# ============================================================================
+# 共通部品（directive ゲート、テスト実行、gh、表示）
+# ============================================================================
+
+def parse_directive_arg(s):
+    m = re.fullmatch(r"[dD]?0*(\d+)", str(s).strip())
+    if not m:
+        raise AgentsExit(2, "directive 指定が不正: %s（d00043 / d43 / 43 のいずれかの形式）" % s)
+    return int(m.group(1))
+
+
+def show_directives_full(st, seqs):
+    for q in sorted(seqs):
+        d = st.directives[q]
+        head = "--- %s" % fmt_d(q)
+        if d.get("scope"):
+            head += " [%s]" % d["scope"]
+        if d.get("supersedes"):
+            head += " ⊃ " + ",".join(fmt_d(x) for x in d["supersedes"])
+        print(head + " ---")
+        print(d.get("text", ""))
+
+
+def directive_gate(st, slug, agent0, branch0, seen_arg, cmd_word):
+    """§8.5 手順4 / §8.6 手順2。復唱成功で claim.seen を CAS 更新。戻り値 SEEN_OK=maxd。
+
+    branch0 が None のときは done（agent 一致のみ検査）。merge は (agent0, branch0) 一致。
+    """
+    claim = st.claims.get(slug)
+    maxd = st.maxd
+    seen = int(claim.get("seen", 0))
+    if seen >= maxd and seen_arg is None:
+        return maxd
+    if seen_arg is None or seen_arg != maxd:
+        unread = [q for q in st.directives if q > seen]
+        show_directives_full(st, unread)
+        # 拒否文は directive 全文と同じ stdout に、全文の後に出す（§8.5 手順4:
+        # 完成形コマンドを出力の先頭に置かない。stderr に出すとパイプ捕捉＝AI ハーネスの
+        # 統合キャプチャで stderr が先に flush され、完成形コマンドが全文より先頭に現れる）
+        print("上記を読み、自分の作業と矛盾しないか判断せよ。記録漏れの口頭指示があるなら先に "
+              "agents directive で記録せよ。矛盾が無いと判断した場合のみ、"
+              "agents %s --seen %s で復唱して再実行" % (cmd_word, fmt_d(maxd)))
+        sys.stdout.flush()
+        raise AgentsExit(3, None)
+
+    def precheck(st2):
+        c = st2.claims.get(slug)
+        if c is None or c.get("agent") != agent0 or (branch0 is not None and c.get("branch") != branch0):
+            return (8, "claim %s は evict/release 済み、または別セッションに再claim 済み。"
+                       "作業を止め、PROTOCOL.md『claim が evict されていた』へ" % slug)
+        maxd2 = st2.maxd
+        if maxd2 != seen_arg:
+            # 全文→拒否文の順で stdout に出す（stderr 分離はパイプ捕捉で順序が逆転する）
+            unread2 = [q for q in st2.directives if q > int(c.get("seen", 0))]
+            show_directives_full(st2, unread2)
+            print("さらに新しい directive が記録されている。読了の上、--seen %s で再実行" % fmt_d(maxd2))
+            sys.stdout.flush()
+            return (3, None)
+        st2.extra["claim"] = c
+        return None
+
+    def mutate(st2):
+        c = dict(st2.extra["claim"])
+        c["seen"] = seen_arg
+        c["refreshed_at"] = now_iso()
+        return [("put", "claims/%s.json" % slug, state_dumps(c))]
+
+    write_state(precheck, mutate, "seen %s %d" % (slug, seen_arg))
+    return seen_arg
+
+
+def run_stream(cmd, cwd, label):
+    """sh -c で実行し、出力をチャンク単位で無遅延に tee しつつ末尾 TEST_LOG_TAIL 行を保持。
+
+    行バッファ転写は禁止（§8.0）: 改行を伴わない進捗出力（pytest のドット等）が
+    行完成まで滞留し、長いテストが停止に見える → merge を殺す誘因になる。
+    """
+    print("$ %s  (cwd=%s)" % (cmd, cwd))
+    sys.stdout.flush()
+    tail = deque(maxlen=TEST_LOG_TAIL)
+    p = subprocess.Popen(["sh", "-c", cmd], cwd=str(cwd),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    fd = p.stdout.fileno()
+    carry = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)          # 読んだバイトを即転写（無遅延）
+        sys.stdout.buffer.flush()
+        carry += chunk
+        parts = carry.split(b"\n")
+        carry = parts.pop()
+        for ln in parts:
+            tail.append(ln.decode("utf-8", "replace"))
+        if len(carry) > 1_000_000:              # 改行なし巨大出力でのメモリ膨張防止
+            tail.append(carry.decode("utf-8", "replace"))
+            carry = b""
+    if carry:
+        tail.append(carry.decode("utf-8", "replace"))
+    p.stdout.close()
+    rc = p.wait()
+    if rc != 0:
+        print("---- %s 失敗（末尾 %d 行を再掲）----" % (label, TEST_LOG_TAIL))
+        for s in tail:
+            print(s)
+    return rc
+
+
+def run_build_and_test(wt):
+    cfg = CTX.cfg
+    if cfg.get("build_cmd"):
+        if run_stream(cfg["build_cmd"], wt, "build") != 0:
+            return "build"
+    if run_stream(cfg["test_cmd"], wt, "test") != 0:
+        return "test"
+    return None
+
+
+def require_test_cmd():
+    if not CTX.cfg.get("test_cmd"):
+        raise AgentsExit(3, "config.json の test_cmd を設定せよ（テスト無しなら \"true\" と明示）")
+
+
+def remote_url():
+    r = git(["config", "--get", "remote.%s.url" % R()])
+    return _t(r.stdout).strip() if r.returncode == 0 else ""
+
+
+def gh_enabled():
+    return (CTX.cfg.get("pr") == "auto" and shutil.which("gh") is not None
+            and "github.com" in remote_url())
+
+
+def gh_run(args):
+    try:
+        return subprocess.run(["gh"] + args, cwd=str(CTX.root), timeout=GH_TIMEOUT,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception:
+        return None
+
+
+def effective_hook_dir():
+    r = git(["config", "--get", "core.hooksPath"])
+    if r.returncode == 0 and _t(r.stdout).strip():
+        hp = Path(_t(r.stdout).strip())
+        return hp if hp.is_absolute() else (CTX.root / hp)
+    return CTX.common_gitdir / "hooks"
+
+
+def _hook_selftest(block, remote_ref, env_extra):
+    """マーカー間ブロックだけを sh で合成 stdin 実行する（ユーザーの後続フック本体は
+    実行しない＝副作用なし）。戻り値は exit code（実行不能は -1）。"""
+    env = dict(os.environ)
+    env.pop("AGENTS_MERGE_TOKEN", None)
+    env.pop("AGENTS_STATE_TOKEN", None)
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    env["GIT_DIR"] = str(CTX.common_gitdir)   # ブロックの stdin 退避先（実 push 時と同じ規約）
+    env.update(env_extra)
+    z = "0" * 40
+    line = "refs/heads/x %s %s %s\n" % (z, remote_ref, z)
+    try:
+        r = subprocess.run(["sh", "-c", block], input=line.encode(),
+                           cwd=str(CTX.root), env=env, timeout=10,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return r.returncode
+    except Exception:
+        return -1
+
+
+def hook_check_ok():
+    """実効フックパスの pre-push の防壁検査（§8.3）。
+
+    (i) マーカー存在、(ii) ブロック内に守備ブランチ名、(iii) 到達可能性
+    （ブロックより前に実行文が無い＝前段の早期 exit で防壁が死んでいない）、
+    (iv) ブロック単体の挙動セルフテスト（トークン無しの保護 ref push を拒否し、
+    トークン有り・非保護 ref は通すこと）。文字列存在だけでは「exit 0 の後ろの
+    死んだブロック」を健全と誤報告するため、(iii)(iv) を必須とする。
+    """
+    f = effective_hook_dir() / "pre-push"
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if HOOK_MARKER not in text or HOOK_MARKER_END not in text:
+        return False
+    lines = text.split("\n")
+    start_idx = next(i for i, ln in enumerate(lines) if HOOK_MARKER in ln)
+    end_idx = next((i for i, ln in enumerate(lines) if HOOK_MARKER_END in ln), None)
+    if end_idx is None or end_idx <= start_idx:
+        return False
+    block = "\n".join(lines[start_idx:end_idx + 1])
+    if ("refs/heads/%s" % M()) not in block or ("refs/heads/%s" % S()) not in block:
+        return False
+    for ln in lines[:start_idx]:              # (iii) shebang・コメント・空行のみ許可
+        s2 = ln.strip()
+        if s2 and not s2.startswith("#"):
+            return False
+    return (_hook_selftest(block, "refs/heads/%s" % M(), {}) != 0
+            and _hook_selftest(block, "refs/heads/%s" % S(), {}) != 0
+            and _hook_selftest(block, "refs/heads/%s" % M(), {"AGENTS_MERGE_TOKEN": "1"}) == 0
+            and _hook_selftest(block, "refs/heads/agents-kit-selftest", {}) == 0)
+
+
+def claim_stale(c):
+    m = age_minutes(c.get("refreshed_at"))
+    return m is not None and m > CTX.cfg["claim_ttl_hours"] * 60
+
+
+def lock_stale(lock):
+    m = age_minutes(lock.get("acquired_at"))
+    ttl = lock.get("ttl_min", CTX.cfg["merge_lock_ttl_min"])
+    return m is not None and m > ttl
+
+
+def worktree_exists(c):
+    w = c.get("worktree")
+    if not w:
+        return False
+    p = Path(w)
+    return (p if p.is_absolute() else CTX.root / p).is_dir()
+
+
+def list_orphans(st):
+    wr = worktree_root_abs()
+    if not wr.is_dir():
+        return []
+    known = set()
+    for c in st.claims.values():
+        w = c.get("worktree")
+        if w:
+            p = Path(w)
+            known.add(str((p if p.is_absolute() else CTX.root / p).resolve()))
+    out = []
+    for d in sorted(wr.iterdir()):
+        if d.is_dir() and str(d.resolve()) not in known:
+            try:
+                rel = d.relative_to(CTX.root)
+                out.append(str(rel))
+            except ValueError:
+                out.append(str(d))
+    return out
+
+
+def main_dirty():
+    r = git(["-C", str(CTX.root), "status", "--porcelain", "-uno"])
+    return bool(_t(r.stdout).strip())
+
+
+# ============================================================================
+# サブコマンド
+# ============================================================================
+
+def cmd_directive(args):
+    text = args.text
+    if not text or not text.strip():
+        raise AgentsExit(2, "指示原文が空。agents directive \"<指示の原文>\"")
+    supersedes = [parse_directive_arg(x) for x in
+                  ([s for s in (args.supersedes or "").split(",") if s.strip()])]
+    ident = self_ident()
+    by = ident["agent"] if ident else "main"
+    box = {}
+
+    def mutate(st):
+        seq = st.counter + 1
+        missing = [q for q in supersedes if q not in st.directives]
+        if missing:
+            box["warn"] = ("supersedes の参照先が存在しない: %s（記録は続行）"
+                           % ", ".join(fmt_d(q) for q in missing))
+        obj = {"by": by, "recorded_at": now_iso(), "scope": args.scope or "",
+               "seq": seq, "text": text}
+        if supersedes:
+            obj["supersedes"] = sorted(supersedes)
+        box["seq"] = seq
+        return [("put", "directives/%s.json" % fmt_d(seq), state_dumps(obj)),
+                ("put", "counter", ("%d\n" % seq).encode())]
+
+    write_state(None, mutate, lambda: "directive %s" % fmt_d(box["seq"]))
+    seq = box["seq"]
+    if args.json:
+        if box.get("warn"):
+            # JSON 本文を汚さず stderr へ（§8.1/§4.2: 警告表示のみで記録は続行）
+            print("警告: " + box["warn"], file=sys.stderr)
+        print(json.dumps({"directive": fmt_d(seq), "seq": seq},
+                         ensure_ascii=False, indent=1, sort_keys=True))
+        return
+    print(fmt_d(seq))
+    if box.get("warn"):
+        print("警告: " + box["warn"])
+    scope = (args.scope or "").strip()
+    print("記録した: %s%s" % (("[%s] " % scope) if scope else "", text))
+    print("担当を取るなら: agents start <slug> --directive %s --paths \"<glob,...>\" --intent \"<1行>\""
+          % fmt_d(seq))
+
+
+def cmd_start(args):
+    slug = args.slug
+    if not SLUG_RE.match(slug) or slug in RESERVED_SLUGS:
+        raise AgentsExit(2, "slug が不正: %s（^[a-z0-9][a-z0-9-]{0,39}$、予約語 merge/state/evict 不可）" % slug)
+    paths = []
+    for p in (args.paths or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        while p.startswith("/") or p.startswith("./"):
+            p = p[1:] if p.startswith("/") else p[2:]
+        paths.append(p)
+    if not paths:
+        raise AgentsExit(2, "--paths が空。触るパスの glob をカンマ区切りで宣言せよ")
+    intent = (args.intent or "").strip()
+    if not intent:
+        raise AgentsExit(2, "--intent が空。1 行の意図を書け")
+    dseq = parse_directive_arg(args.directive)
+    interfaces = [s.strip() for s in (args.interfaces or "").split(",") if s.strip()]
+
+    agent = secrets.token_hex(3)
+    branch = "agent/%s/%s" % (agent, slug)
+    wt_abs = worktree_root_abs() / ("%s-%s" % (slug, agent))
+    try:
+        wt_rel = str(wt_abs.relative_to(CTX.root))
+    except ValueError:
+        wt_rel = str(wt_abs)
+    fetch_main()
+    box = {}
+
+    def precheck(st):
+        # CAS ループ内で毎回 (a)(b)(c) と base_sha を取り直す（I-CAS / I-SHA）
+        if dseq not in st.directives:
+            return (3, "directive %s が存在しない。先に agents directive で記録せよ" % fmt_d(dseq))
+        other = st.claims.get(slug)
+        if other is not None:
+            return (4, ("slug %s は使用中。\n  agent=%s intent=%s paths=%s 経過=%s\n"
+                        "別 slug にするか、agents sync で状況確認、必要なら agents evict --dry-run で生死確認")
+                    % (slug, other.get("agent"), other.get("intent"),
+                       ",".join(other.get("paths", [])), fmt_age(other.get("refreshed_at"))))
+        fetch_main()
+        base_sha = rev_parse_q("refs/remotes/%s/%s" % (R(), M()))
+        if base_sha is None:
+            return (3, "refs/remotes/%s/%s が無い。install.sh とブートストラップ push を確認せよ" % (R(), M()))
+        files = ls_tree_files(base_sha)
+        for oslug, oc in st.claims.items():
+            pair = find_overlap(paths, oc.get("paths", []), files)
+            if pair:
+                return (4, ("パス重複: 自分の %r と claim %s（intent=%s, agent=%s）の %r が交差する。\n"
+                            "パス宣言を狭めるか、相手の完了を待て（機械判定は安全側の過検出。§6）")
+                        % (pair[0], oslug, oc.get("intent"), oc.get("agent"), pair[1]))
+        st.extra["base_sha"] = base_sha
+        return None
+
+    def mutate(st):
+        base_sha = st.extra["base_sha"]
+        box["base_sha"] = base_sha
+        box["maxd"] = st.maxd
+        box["dtext"] = st.directives[dseq].get("text", "")
+        box["others"] = [(s2, c2) for s2, c2 in sorted(st.claims.items())]
+        box["tail"] = sorted(st.directives.keys())[-5:]
+        box["dirs"] = st.directives
+        now = now_iso()
+        claim = {"agent": agent, "base_sha": base_sha, "branch": branch,
+                 "claimed_at": now, "directive": dseq, "intent": intent,
+                 "interfaces": interfaces, "paths": paths, "refreshed_at": now,
+                 "seen": st.maxd, "slug": slug, "status": "active", "worktree": wt_rel}
+        return [("put", "claims/%s.json" % slug, state_dumps(claim))]
+
+    write_state(precheck, mutate, "claim %s (%s)" % (slug, agent))
+    base_sha = box["base_sha"]
+
+    # worktree 作成（I-SHA: 明示 SHA 起点。§8.2 手順5）
+    try:
+        worktree_root_abs().mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    def cleanup():
+        git(["worktree", "remove", "--force", str(wt_abs)])
+        git(["branch", "-D", branch])
+        git(["worktree", "prune"])
+
+    try:
+        worktree_retry(["worktree", "add", "-b", branch, str(wt_abs), base_sha], cleanup=cleanup)
+    except AgentsExit as e:
+        # ロールバック: 自分の claim だけを削除（他者の再claim を消さない。I-OWNER）
+        def rb_pre(st):
+            c = st.claims.get(slug)
+            if c is None or c.get("agent") != agent:
+                return (8, "claim は既に失われている（別セッションが再claim した可能性）。claim 削除は行わない")
+            st.extra["c"] = c
+            return None
+
+        def rb_mut(st):
+            return [("del", "claims/%s.json" % slug)]
+
+        try:
+            write_state(rb_pre, rb_mut, "release %s" % slug)
+        except AgentsExit as e2:
+            print("警告: claim ロールバックに失敗: %s" % (e2.msg or e2.code), file=sys.stderr)
+        raise AgentsExit(6, "worktree 作成に失敗（claim はロールバック済み）:\n%s" % (e.msg or ""))
+
+    gd = git(["rev-parse", "--absolute-git-dir"], cwd=wt_abs)
+    if gd.returncode != 0:
+        raise AgentsExit(6, "worktree の gitdir 解決に失敗: " + _t(gd.stderr))
+    (Path(_t(gd.stdout).strip()) / "agents.json").write_text(
+        json.dumps({"slug": slug, "agent": agent, "branch": branch},
+                   ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+
+    print("claim 完了: %s (agent=%s)" % (slug, agent))
+    print("worktree: %s" % wt_abs)
+    print("branch:   %s" % branch)
+    print("base_sha: %s" % base_sha[:12])
+    print("directive: %s %s" % (fmt_d(dseq), box["dtext"]))
+    others = [(s2, c2) for s2, c2 in box["others"] if s2 != slug and c2.get("status") == "active"]
+    if others:
+        print("他の active claim（intent/interfaces を読み、意味の衝突が無いか判断せよ）:")
+        for s2, c2 in others:
+            print("  - %s (agent=%s) intent=%s paths=%s interfaces=%s"
+                  % (s2, c2.get("agent"), c2.get("intent"),
+                     ",".join(c2.get("paths", [])), ",".join(c2.get("interfaces", []))))
+    if box["tail"]:
+        print("直近 directive:")
+        for q in box["tail"]:
+            d = box["dirs"][q]
+            print("  %s %s%s" % (fmt_d(q), ("[%s] " % d["scope"]) if d.get("scope") else "",
+                                 d.get("text", "").splitlines()[0] if d.get("text") else ""))
+    print("cd %s して作業せよ。以後の agents コマンドはその worktree 内で実行"
+          "（実体はどの checkout にも入っている `.agents/bin/agents`。"
+          "見つからない場合は絶対パス `%s/.agents/bin/agents` を使え）。"
+          "定期的に agents sync（claim の延命は worktree 内での sync だけが行う）。"
+          % (wt_abs, CTX.root))
+
+
+def _collect_view(st, main_sha, ident):
+    """sync/status 共通の表示データ組み立て。"""
+    lost = False
+    if ident:
+        c = st.claims.get(ident["slug"])
+        if c is None or c.get("agent") != ident["agent"]:
+            lost = True
+    return lost
+
+
+def _render_state(st, main_sha, ident, lost, prs=None):
+    warnings = []
+    if lost:
+        print("!! あなたの claim %s は失われた（evict/release/再claim）。"
+              "作業を止め、PROTOCOL.md『claim が evict されていた』に従え" % ident["slug"])
+        warnings.append("claim_lost")
+
+    self_claim = st.claims.get(ident["slug"]) if (ident and not lost) else None
+    line = "main: %s" % (main_sha[:12] if main_sha else "(未fetch)")
+    if self_claim and main_sha:
+        rb = git(["rev-list", "--count", "%s..%s" % (self_claim.get("base_sha"), main_sha)])
+        if rb.returncode == 0:
+            line += "（base_sha からの遅れ: %s コミット）" % _t(rb.stdout).strip()
+    print(line)
+
+    if st.lock:
+        stale = lock_stale(st.lock)
+        print("lock: 保持者 %s/%s 取得 %s%s"
+              % (st.lock.get("agent"), st.lock.get("slug"), fmt_age(st.lock.get("acquired_at")),
+                 " !! STALE — agents evict --dry-run で生死確認の上 agents evict --lock-only" if stale else ""))
+        if stale:
+            warnings.append("stale_lock")
+    else:
+        print("lock: なし")
+
+    print("claims:")
+    if not st.claims:
+        print("  （なし）")
+    for slug in sorted(st.claims):
+        c = st.claims[slug]
+        stale = claim_stale(c)
+        if stale:
+            warnings.append("stale_claim")
+        note = "" if worktree_exists(c) else " (worktree不在 — 別クローンの作業か、start 途中死の可能性)"
+        prcol = ""
+        if prs and c.get("branch") in prs:
+            n, url = prs[c["branch"]]
+            prcol = " PR#%s %s" % (n, url)
+        print("  %-20s %s %-6s 開始%s 更新%s%s paths=%s intent=%s%s%s"
+              % (slug, c.get("agent"), c.get("status"),
+                 fmt_age(c.get("claimed_at")), fmt_age(c.get("refreshed_at")),
+                 " !! STALE" if stale else "", ",".join(c.get("paths", [])),
+                 c.get("intent"), note, prcol))
+
+    print("directives:")
+    seqs = sorted(st.directives.keys())
+    shown = seqs if getattr(CTX, "show_all_directives", False) else seqs[-DIRECTIVE_TAIL:]
+    new_seen = int(self_claim.get("seen", 0)) if self_claim else None
+    has_new = False
+    for q in shown:
+        d = st.directives[q]
+        mark = ""
+        if new_seen is not None and q > new_seen:
+            mark = "!! NEW "
+            has_new = True
+        sup = (" ⊃ " + ",".join(fmt_d(x) for x in d["supersedes"])) if d.get("supersedes") else ""
+        text1 = d.get("text", "").replace("\n", " ")
+        scope = ("[%s] " % d["scope"]) if d.get("scope") else ""
+        print("  %s%s %s%s%s" % (mark, fmt_d(q), scope, text1, sup))
+    if not seqs:
+        print("  （なし）")
+
+    orphans = list_orphans(st)
+    if orphans:
+        print("孤児 worktree（どの claim にも属さない）:")
+        for o in orphans:
+            print("  - %s" % o)
+        print("  中身（未 push の作業）を確認し、ユーザーに報告してから片付けよ。")
+
+    warn_lines = []
+    if not CTX.cfg.get("test_cmd"):
+        warn_lines.append("test_cmd 未設定。done/merge は拒否される。config.json に設定せよ（テスト無しなら \"true\"）")
+        warnings.append("test_cmd_unset")
+    if not hook_check_ok():
+        warn_lines.append("main 直 push 防壁が実効フックパスに無い/不整合。install.sh を再実行せよ")
+        warnings.append("hook_missing")
+    if any(claim_stale(c) for c in st.claims.values()):
+        warn_lines.append("stale claim あり。evict の前に `agents evict --dry-run` で確認せよ。"
+                          "自分の別ターミナルが生きているかもしれない")
+    if has_new:
+        warn_lines.append("!! NEW を読み、自分の作業と矛盾しないか判断せよ。矛盾したら "
+                          "PROTOCOL.md『新 directive と矛盾したら』へ。done/merge には "
+                          "--seen d<最大seq> が必要")
+        warnings.append("new_directives")
+    if main_dirty():
+        warn_lines.append("主 checkout が汚れている。AI セッションは ROOT に書き込むな（人間の作業なら無視してよい）")
+        warnings.append("main_dirty")
+    if ident is None:
+        warn_lines.append("注意: ここでは claim は延命されない。延命は作業 worktree 内の sync のみ")
+    if warn_lines:
+        print("警告:")
+        for w in warn_lines:
+            print("  - %s" % w)
+    return warnings, orphans
+
+
+def _json_state(st, main_sha, ident, lost, warnings, orphans):
+    self_obj = None
+    if ident:
+        self_obj = {"slug": ident["slug"], "agent": ident["agent"], "branch": ident["branch"]}
+    obj = {
+        "main_sha": main_sha,
+        "state_tip": st.tip,
+        "lock": st.lock,
+        "claims": [st.claims[s] for s in sorted(st.claims)],
+        "directives": [st.directives[q] for q in sorted(st.directives)],
+        "self": self_obj,
+        "orphans": orphans,
+        "warnings": sorted(set(warnings)),
+    }
+    print(json.dumps(obj, ensure_ascii=False, indent=1, sort_keys=True))
+
+
+def cmd_sync(args):
+    CTX.show_all_directives = args.all
+    st = read_state()
+    fetch_main()
+    main_sha = rev_parse_q("refs/remotes/%s/%s" % (R(), M()))
+    ident = self_ident()
+    lost = _collect_view(st, main_sha, ident)
+
+    if args.json:
+        # §8.3 は手順3（表示）→手順4（延命）の順。JSON を先に出してから延命する
+        # （延命 CAS 中の claim 喪失レースでも「JSON なしの exit 8」を返さない）
+        warnings, orphans = _json_warnings(st, main_sha, ident, lost)
+        _json_state(st, main_sha, ident, lost, warnings, orphans)
+        sys.stdout.flush()
+        _refresh_if_needed(st, ident, lost)
+        if lost:
+            raise AgentsExit(8, None)
+        return
+    warnings, orphans = _render_state(st, main_sha, ident, lost)
+    _refresh_if_needed(st, ident, lost)
+    if lost:
+        raise AgentsExit(8, "!! あなたの claim %s は失われた（evict/release/再claim）。"
+                            "作業を止め、PROTOCOL.md『claim が evict されていた』に従え" % ident["slug"])
+
+
+def _json_warnings(st, main_sha, ident, lost):
+    warnings = []
+    if lost:
+        warnings.append("claim_lost")
+    if not CTX.cfg.get("test_cmd"):
+        warnings.append("test_cmd_unset")
+    if not hook_check_ok():
+        warnings.append("hook_missing")
+    if st.lock and lock_stale(st.lock):
+        warnings.append("stale_lock")
+    if any(claim_stale(c) for c in st.claims.values()):
+        warnings.append("stale_claim")
+    self_claim = st.claims.get(ident["slug"]) if (ident and not lost) else None
+    if self_claim and st.maxd > int(self_claim.get("seen", 0)):
+        warnings.append("new_directives")
+    if main_dirty():
+        warnings.append("main_dirty")
+    return warnings, list_orphans(st)
+
+
+def _refresh_if_needed(st, ident, lost):
+    """§8.3 手順4: 延命は claim worktree 内かつ自 claim（I-OWNER）のみ。"""
+    if not ident or lost:
+        return
+    c = st.claims.get(ident["slug"])
+    if c is None:
+        return
+    m = age_minutes(c.get("refreshed_at"))
+    if m is None or m <= CTX.cfg["claim_ttl_hours"] * 60 / 4.0:
+        return
+    slug, agent = ident["slug"], ident["agent"]
+
+    def precheck(st2):
+        c2 = st2.claims.get(slug)
+        if c2 is None or c2.get("agent") != agent:
+            return (8, "!! あなたの claim %s は失われた（evict/release/再claim）。"
+                       "作業を止め、PROTOCOL.md『claim が evict されていた』に従え" % slug)
+        st2.extra["c"] = c2
+        return None
+
+    def mutate(st2):
+        c2 = dict(st2.extra["c"])
+        c2["refreshed_at"] = now_iso()
+        return [("put", "claims/%s.json" % slug, state_dumps(c2))]
+
+    write_state(precheck, mutate, "refresh %s" % slug)
+
+
+def cmd_status(args):
+    tip = rev_parse_q("refs/remotes/%s/%s" % (R(), S()))
+    if tip is None:
+        raise AgentsExit(3, "未 fetch。agents sync を実行せよ")
+    st = load_state_from_tip(tip)
+    main_sha = rev_parse_q("refs/remotes/%s/%s" % (R(), M()))
+    ident = self_ident()
+    lost = _collect_view(st, main_sha, ident)
+    prs = None
+    if shutil.which("gh"):
+        r = gh_run(["pr", "list", "--json", "number,headRefName,baseRefName,title,url"])
+        if r is not None and r.returncode == 0:
+            try:
+                prs = {p["headRefName"]: (p["number"], p["url"]) for p in json.loads(_t(r.stdout))}
+            except Exception:
+                prs = None
+    if args.json:
+        warnings, orphans = _json_warnings(st, main_sha, ident, lost)
+        _json_state(st, main_sha, ident, lost, warnings, orphans)
+        return
+    _render_state(st, main_sha, ident, lost, prs=prs)
+
+
+def cmd_done(args):
+    ident = self_ident()
+    if ident is None:
+        raise AgentsExit(3, "claim worktree 内で実行せよ（agents start が作った worktree に cd する）")
+    slug, agent, branch = ident["slug"], ident["agent"], ident["branch"]
+    wt = cwd_toplevel()
+    rs = git(["status", "--porcelain"], cwd=wt)
+    dirty = _t(rs.stdout).strip()
+    if dirty:
+        print(dirty)
+        raise AgentsExit(3, "未コミットの変更がある。全てコミットせよ"
+                            "（rebase 途中ならば解消して git rebase --continue）")
+    st = read_state()
+    c = st.claims.get(slug)
+    if c is None or c.get("agent") != agent:
+        raise AgentsExit(8, "claim は evict/release 済み、または同 slug が別セッションに再claim 済み。"
+                            "あなたの変更は claim に反映してはならない。"
+                            "PROTOCOL.md『claim が evict されていた』へ")
+    seen_arg = parse_directive_arg(args.seen) if args.seen else None
+    directive_gate(st, slug, agent, None, seen_arg, "done")
+
+    fetch_main()
+    rr = git(["rebase", "refs/remotes/%s/%s" % (R(), M())], cwd=wt)
+    sys.stdout.write(_t(rr.stdout))
+    sys.stderr.write(_t(rr.stderr))
+    if rr.returncode != 0:
+        raise AgentsExit(6, "rebase がコンフリクトで停止した。"
+                            "解消 → git add → git rebase --continue → 再度 agents done")
+    require_test_cmd()
+    fail = run_build_and_test(wt)
+    if fail:
+        raise AgentsExit(6, "%s が失敗した。push しない。直してから再度 agents done" % fail)
+
+    # push 直前の branch fetch（応答喪失後の lease 恒久拒否の防止。§8.5 手順7）
+    fetch_branch(branch, allow_missing=True)
+    rp = git(["push", "--force-with-lease", R(), "HEAD:refs/heads/%s" % branch], cwd=wt)
+    if rp.returncode != 0:
+        raise AgentsExit(6, "branch push に失敗:\n" + _t(rp.stderr))
+
+    pr_url = None
+    if gh_enabled():
+        r = gh_run(["pr", "list", "--head", branch, "--json", "number,baseRefName,url"])
+        existing = None
+        if r is not None and r.returncode == 0:
+            try:
+                lst = json.loads(_t(r.stdout))
+                existing = lst[0] if lst else None
+            except Exception:
+                existing = None
+        if existing:
+            pr_url = existing.get("url")
+            if existing.get("baseRefName") != M():
+                r2 = gh_run(["pr", "edit", str(existing["number"]), "--base", M()])
+                if r2 is None or r2.returncode != 0:
+                    print("警告: 既存 PR の base 矯正に失敗（続行）", file=sys.stderr)
+        else:
+            c0 = st.claims.get(slug, {})
+            r3 = gh_run(["pr", "create", "--base", M(), "--head", branch,
+                         "--title", "%s: %s" % (slug, c0.get("intent", "")),
+                         "--body", "directive %s / agents-kit" % fmt_d(int(c0.get("directive", 0)))])
+            if r3 is not None and r3.returncode == 0:
+                pr_url = _t(r3.stdout).strip()
+            else:
+                print("警告: PR 作成に失敗（続行。merge には影響しない）", file=sys.stderr)
+
+    def precheck(st2):
+        c2 = st2.claims.get(slug)
+        if c2 is None or c2.get("agent") != agent:
+            return (8, "claim は evict/release 済み、または別セッションに再claim 済み。"
+                       "PROTOCOL.md『claim が evict されていた』へ")
+        st2.extra["c"] = c2
+        return None
+
+    def mutate(st2):
+        c2 = dict(st2.extra["c"])
+        c2["status"] = "ready"
+        c2["refreshed_at"] = now_iso()
+        return [("put", "claims/%s.json" % slug, state_dumps(c2))]
+
+    write_state(precheck, mutate, "ready %s" % slug)
+    print("done: %s は ready。次: agents merge %s" % (slug, slug))
+    if pr_url:
+        print("PR: %s" % pr_url)
+
+
+# ---------------------------------------------------------------------------
+# merge（§8.6）
+# ---------------------------------------------------------------------------
+
+def _unlock(run):
+    """§8.6b UNLOCK。手順3成功後のあらゆる失敗 exit はここを経由する。"""
+    def precheck(st):
+        if st.lock is None or st.lock.get("agent") != run:
+            return (0, "ロックは自分のものではないため触らない")
+        return None
+
+    def mutate(st):
+        return [("del", "locks/merge.json")]
+
+    try:
+        write_state(precheck, mutate, "unlock merge", on_precheck_fail="skip")
+    except AgentsExit as e:
+        print("警告: UNLOCK に失敗（TTL が回収する）: %s" % (e.msg or e.code), file=sys.stderr)
+
+
+def _lock_acquire(run, slug):
+    box = {"takeover": None}
+
+    def precheck(st):
+        lk = st.lock
+        if lk is None:
+            box["takeover"] = None
+            return None
+        if lock_stale(lk):
+            box["takeover"] = (lk.get("agent"), lk.get("slug"),
+                               int(age_minutes(lk.get("acquired_at")) or 0))
+            return None
+        remain = int((lk.get("ttl_min", CTX.cfg["merge_lock_ttl_min"])
+                      - (age_minutes(lk.get("acquired_at")) or 0)))
+        return (4, "merge ロック保持者 %s/%s、残 %d 分。待って再実行"
+                % (lk.get("agent"), lk.get("slug"), max(remain, 0)))
+
+    def mutate(st):
+        # stale ロックは同一 CAS commit 内で置換（put が上書き）
+        obj = {"acquired_at": now_iso(), "agent": run, "slug": slug,
+               "ttl_min": CTX.cfg["merge_lock_ttl_min"]}
+        return [("put", "locks/merge.json", state_dumps(obj))]
+
+    write_state(precheck, mutate, "lock merge %s" % slug)
+    if box["takeover"]:
+        a, s2, mins = box["takeover"]
+        print("stale ロック（%s/%s, %d分）を奪取した。前保持者のテストがまだ走っている可能性はあるが、"
+              "安全は main push の FF 検査が守る。奪取警告が出ても手動修復は不要" % (a, s2, mins))
+
+
+def _heartbeat(run, slug):
+    """§8.6 手順8 前半。precheck 不成立は警告のみで続行（on_precheck_fail="skip" 許可箇所）。"""
+    def precheck(st):
+        if st.lock is None or st.lock.get("agent") != run:
+            return (0, "ロックは奪取されている。安全は push の FF 検査が守るので続行する")
+        st.extra["lk"] = st.lock
+        return None
+
+    def mutate(st):
+        lk = dict(st.extra["lk"])
+        lk["acquired_at"] = now_iso()
+        return [("put", "locks/merge.json", state_dumps(lk))]
+
+    write_state(precheck, mutate, "heartbeat merge %s" % slug, on_precheck_fail="skip")
+
+
+def _worktree_remove(path, warn_only=False):
+    def cleanup():
+        git(["worktree", "prune"])
+    try:
+        worktree_retry(["worktree", "remove", "--force", str(path)], cleanup=cleanup)
+        git(["worktree", "prune"])
+    except AgentsExit as e:
+        if warn_only:
+            print("警告: merge worktree の除去に失敗: %s" % (e.msg or ""), file=sys.stderr)
+        else:
+            raise
+
+
+def _lease_delete_branch(branch0, br_tip):
+    """§8.6 手順12a: 検証時 tip のままのときだけ削除（I-VERIFY-THEN-DELETE）。
+
+    lease 拒否の判定は lease 固有パターン（stale info / incorrect old value）に限定する。
+    削除保護・pre-receive 等の他の remote rejected を lease 拒否と誤診断すると
+    「done をやり直せ」という解決しない誤誘導ループになるため、そちらは stderr 全文つきの
+    一般警告に落とす。lease 分岐でも stderr 全文を併記する（真因を隠さない）。
+    """
+    r = git(["push", "--force-with-lease=refs/heads/%s:%s" % (branch0, br_tip),
+             R(), ":refs/heads/%s" % branch0])
+    if r.returncode != 0:
+        err = _t(r.stderr)
+        if "stale info" in err or "incorrect old value" in err:
+            print("警告: branch の tip が検証時から動いている（lease 拒否）ため削除しなかった。"
+                  "所有者は agents done をやり直せ:\n" + err.rstrip())
+        else:
+            print("警告: リモート branch 削除に失敗（残置。手動確認可）:\n" + err.rstrip(), file=sys.stderr)
+    rb = git(["branch", "-D", branch0])
+    if rb.returncode != 0:
+        print("警告: ローカル branch %s は削除できなかった（claim worktree で checkout 中なら正常）" % branch0)
+
+
+def _merge_log_obj(seq, slug, agent0, branch0, br, directive, seen_ok,
+                   main_before, main_after, merge_commit, tests, recovery,
+                   allowed_lost=None, reason=None):
+    obj = {"agent": agent0, "allowed_lost": allowed_lost or [], "branch": branch0,
+           "branch_tip": br, "directive": directive, "kind": "merge",
+           "main_after": main_after, "main_before": main_before,
+           "merge_commit": merge_commit, "merged_at": now_iso(),
+           "recovery": recovery, "seen": seen_ok, "seq": seq, "slug": slug,
+           "tests": tests}
+    if reason:
+        obj["reason"] = reason
+    return obj
+
+
+def cmd_merge(args):
+    run = secrets.token_hex(3)                     # 手順0: run token（claim の agent とは別物）
+    if args.slug:
+        slug = args.slug
+    else:
+        ident = self_ident()
+        if ident is None:
+            raise AgentsExit(2, "worktree 外では slug を指定せよ: agents merge <slug>")
+        slug = ident["slug"]
+    allow = [s.strip() for s in (args.allow_lost_symbols or "").split(",") if s.strip()]
+    if allow and not (args.reason or "").strip():
+        raise AgentsExit(2, "--allow-lost-symbols には --reason \"<1行>\" が必須")
+
+    # 手順1: 前提
+    require_test_cmd()
+    st = read_state()
+    claim = st.claims.get(slug)
+    if claim is None:
+        raise AgentsExit(3, "claim が無い。evict/merge 済みか slug 誤り")
+    if claim.get("status") != "ready":
+        raise AgentsExit(3, "claim %s は active。先に agents done" % slug)
+    agent0, branch0 = claim.get("agent"), claim.get("branch")
+    directive0 = int(claim.get("directive", 0))
+    intent0 = claim.get("intent", "")
+
+    # 手順2: directive ゲート（agent0/branch0 一致検査つき）
+    seen_arg = parse_directive_arg(args.seen) if args.seen else None
+    seen_ok = directive_gate(st, slug, agent0, branch0, seen_arg, "merge %s" % slug)
+
+    # 手順3: ロック取得。以降のあらゆる失敗 exit は UNLOCK 経由（§8.6b）
+    _lock_acquire(run, slug)
+    locked = True
+    try:
+        restarts = 0
+        merge_sha = None
+        wt = None
+        while True:
+            # 手順4（再走の起点は常にここ）
+            fetch_main()
+            if not fetch_branch(branch0, allow_missing=True):
+                raise AgentsExit(3, "branch %s が push されていない。agents done をやり直せ" % branch0)
+            br = rev_parse_q("refs/remotes/%s/%s" % (R(), branch0))
+            if br is None:
+                raise AgentsExit(3, "branch %s が push されていない。agents done をやり直せ" % branch0)
+            local = rev_parse_q("refs/heads/%s" % branch0)
+            if local is not None and local != br:
+                raise AgentsExit(3, "ローカル %s に未 push コミットあり。agents done をやり直せ" % branch0)
+            m_sha = rev_parse_q("refs/remotes/%s/%s" % (R(), M()))
+            if m_sha is None:
+                raise AgentsExit(6, "refs/remotes/%s/%s を解決できない" % (R(), M()))
+
+            # 手順4b: 既マージ検出（回収経路）
+            if is_ancestor(br, m_sha):
+                _recovery(run, slug, agent0, branch0, br, m_sha, directive0, seen_ok)
+                locked = False   # 4b の複合コミット（または UNLOCK 相当の条件つき削除）が処理済み
+                _lease_delete_branch(branch0, br)
+                return
+
+            # 手順5: クリーン worktree
+            wt = worktree_root_abs() / ("merge-%s" % run)
+
+            def cleanup():
+                git(["worktree", "remove", "--force", str(wt)])
+                git(["worktree", "prune"])
+
+            worktree_retry(["worktree", "add", "--detach", str(wt), m_sha], cleanup=cleanup)
+            rs = git(["status", "--porcelain"], cwd=wt)
+            if _t(rs.stdout).strip():
+                raise AgentsExit(7, "クリーンであるべき新規 worktree が汚れている。"
+                                    "repo の filter/EOL 設定を疑え（worktree: %s）" % wt)
+
+            # 手順6: シミュレーション兼本マージ
+            rm = git(["merge", "--no-ff", "-m", "merge %s (%s): %s" % (slug, fmt_d(directive0), intent0), br],
+                     cwd=wt)
+            if rm.returncode != 0:
+                sys.stdout.write(_t(rm.stdout))
+                git(["merge", "--abort"], cwd=wt)
+                _worktree_remove(wt, warn_only=True)
+                raise AgentsExit(4, "マージコンフリクト。main が進んでいる。"
+                                    "所有 worktree で agents done（rebase+テスト）をやり直してから再度 merge")
+            merge_sha = rev_parse_q("HEAD", cwd=wt)
+
+            # 手順7: シンボル消失チェック
+            violations, unchecked = symbol_check(m_sha, br, merge_sha)
+            if unchecked:
+                print("未検査（拡張子表に無い/サイズ超過）:")
+                for f, why in unchecked:
+                    print("  - %s (%s)" % (f, why))
+            remaining = [(f, s, k) for (f, s, k) in violations if s not in set(allow)]
+            if remaining:
+                print("シンボル消失を検出:")
+                for f, s2, k in remaining:
+                    print("  %s: %s (%s)" % (f, s2, k))
+                raise AgentsExit(7, (
+                    "まず merge worktree（%s）で消失箇所を目で確認せよ。"
+                    "`--allow-lost-symbols` は**ユーザーの明示承認が無い限り使用禁止**"
+                    "（--reason 必須、agent-state に記録され監査される）" % wt))
+
+            # 手順8: ハートビート → build+test（1 マージごとにフルテスト。I-TEST-EACH）
+            _heartbeat(run, slug)
+            fail = run_build_and_test(wt)
+            if fail:
+                raise AgentsExit(6, "%s が失敗した。merge worktree を調査用に残した: %s" % (fail, wt))
+
+            # 手順9: push 直前の directive 再確認 → main push（最終 CAS）
+            st9 = read_state()
+            if st9.maxd > seen_ok:
+                # 全文→拒否文の順で stdout に出す（§8.5 手順4 と同じ表示順規律）
+                new = [q for q in st9.directives if q > seen_ok]
+                show_directives_full(st9, new)
+                print("テスト中に新しい指示が記録された。読んで矛盾判断の上、"
+                      "--seen %s を付けて merge を再実行せよ" % fmt_d(st9.maxd))
+                sys.stdout.flush()
+                _worktree_remove(wt, warn_only=True)
+                raise AgentsExit(3, None)
+            rp = git(["push", R(), "HEAD:refs/heads/%s" % M()], cwd=wt,
+                     env_extra={"AGENTS_MERGE_TOKEN": "1"})
+            if rp.returncode == 0:
+                break
+            err = _t(rp.stderr)
+            if is_cas_stderr(err):
+                _worktree_remove(wt, warn_only=True)
+                if restarts < MERGE_RESTART_MAX:
+                    restarts += 1
+                    print("main が動いた（CAS 敗北）。新しい main に対して再マージ・再テストする（再走 %d/%d）"
+                          % (restarts, MERGE_RESTART_MAX))
+                    continue
+                raise AgentsExit(5, "merge 再走上限。stderr 全文:\n" + err)
+            raise AgentsExit(6, "main push に失敗（merge worktree を残した: %s）:\n%s" % (wt, err))
+
+        # 手順10: 反映確認
+        fetch_main()
+        if not is_ancestor(merge_sha, rev_parse_q("refs/remotes/%s/%s" % (R(), M())) or ""):
+            raise AgentsExit(7, "push 成功後の反映確認に失敗（merge commit が origin/%s の祖先でない）。"
+                                "ブランチは消さない。ユーザーに報告せよ" % M())
+
+        # 手順11: 状態確定（成功経路専用の複合コミット。lock 削除もここで行う）
+        flags = {}
+
+        def mutate(st2):
+            seq = st2.counter + 1
+            changes = [("put", "log/e%05d-merge-%s.json" % (seq, slug),
+                        state_dumps(_merge_log_obj(seq, slug, agent0, branch0, br, directive0,
+                                                   seen_ok, m_sha, merge_sha, merge_sha, "pass",
+                                                   False, allow, (args.reason or "").strip() or None))),
+                       ("put", "counter", ("%d\n" % seq).encode())]
+            c2 = st2.claims.get(slug)
+            if c2 is not None and c2.get("agent") == agent0 and c2.get("branch") == branch0:
+                changes.append(("del", "claims/%s.json" % slug))
+                flags.pop("claim_kept", None)
+            elif c2 is not None:
+                flags["claim_kept"] = True
+            if st2.lock is not None and st2.lock.get("agent") == run:
+                changes.append(("del", "locks/merge.json"))
+                flags.pop("lock_kept", None)
+            elif st2.lock is not None:
+                flags["lock_kept"] = True
+            return changes
+
+        write_state(None, mutate, "merge-log %s" % slug)
+        locked = False
+        if flags.get("claim_kept"):
+            print("警告: claim は merge 中に別セッションへ渡った。claim は残す")
+        if flags.get("lock_kept"):
+            print("警告: ロックが奪取されていた（安全性は手順9の FF 検査が担保済み）")
+
+        # 手順12: 後片付け
+        _lease_delete_branch(branch0, br)
+        _worktree_remove(wt, warn_only=True)
+        print("merged: %s → %s" % (merge_sha[:12], M()))
+        print("PR があれば GitHub 上で自動的に merged になる")
+        print("所有 worktree の片付け: 中身を確認し、未 push の変更が無いことを見てから "
+              "git worktree remove <claim worktree>")
+    except AgentsExit:
+        if locked:
+            _unlock(run)
+        raise
+
+
+def _recovery(run, slug, agent0, branch0, br, m_sha, directive0, seen_ok):
+    """§8.6 手順4b。テスト省略・first-parent 走査で実マージコミット特定・recovery ログ。"""
+    rl = git(["rev-list", "--first-parent", "--parents", "-n", str(RECOVERY_SCAN), m_sha])
+    merge_commit = main_before = main_after = None
+    if rl.returncode == 0:
+        for line in _t(rl.stdout).split("\n"):
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == br:   # 第2親が BR の行（§8.6 手順4b）
+                merge_commit = parts[0]
+                main_before = parts[1]
+                main_after = merge_commit
+                break
+    flags = {}
+
+    def mutate(st2):
+        seq = st2.counter + 1
+        changes = [("put", "log/e%05d-merge-%s.json" % (seq, slug),
+                    state_dumps(_merge_log_obj(seq, slug, agent0, branch0, br, directive0,
+                                               seen_ok, main_before, main_after, merge_commit,
+                                               "skipped-recovery", True))),
+                   ("put", "counter", ("%d\n" % seq).encode())]
+        c2 = st2.claims.get(slug)
+        if c2 is not None and c2.get("agent") == agent0 and c2.get("branch") == branch0:
+            changes.append(("del", "claims/%s.json" % slug))
+            flags.pop("claim_kept", None)
+        elif c2 is not None:
+            flags["claim_kept"] = True
+        if st2.lock is not None and st2.lock.get("agent") == run:
+            changes.append(("del", "locks/merge.json"))
+        return changes
+
+    write_state(None, mutate, "merge-log %s" % slug)
+    if flags.get("claim_kept"):
+        print("警告: claim は別セッションが再取得済み。claim は残す")
+    print("既マージを検出し回収した: %s" % (merge_commit[:12] if merge_commit else "不明"))
+
+
+def cmd_release(args):
+    ident = self_ident()
+    if args.slug:
+        slug = args.slug
+    else:
+        if ident is None:
+            raise AgentsExit(2, "worktree 外では slug を指定せよ: agents release <slug>")
+        slug = ident["slug"]
+    my_agent = ident["agent"] if ident else None
+    box = {}
+
+    def precheck(st):
+        c = st.claims.get(slug)
+        if c is None:
+            return (3, "claim %s は存在しない" % slug)
+        if not args.force and c.get("agent") != my_agent:
+            return (3, "claim %s は他セッション（agent=%s）のもの。所有者が死んだと確信できる時のみ "
+                       "agents release %s --force（迷ったらユーザーに確認）" % (slug, c.get("agent"), slug))
+        st.extra["c"] = c
+        return None
+
+    def mutate(st):
+        c = st.extra["c"]
+        seq = st.counter + 1
+        box["c"] = c
+        obj = {"agent": c.get("agent"), "kind": "release",
+               "released_at": now_iso(), "seq": seq, "slug": slug}
+        return [("del", "claims/%s.json" % slug),
+                ("put", "log/e%05d-release-%s.json" % (seq, slug), state_dumps(obj)),
+                ("put", "counter", ("%d\n" % seq).encode())]
+
+    write_state(precheck, mutate, "release %s" % slug)
+    c = box["c"]
+    print("released: %s" % slug)
+    print("branch %s と worktree %s は残っている。中身（未 push の作業）を確認し、"
+          "ユーザーに報告してから片付けよ: git worktree remove <path> / git push %s :refs/heads/%s"
+          % (c.get("branch"), c.get("worktree"), R(), c.get("branch")))
+
+
+def cmd_evict(args):
+    st = read_state()
+    stale_claims = {s: c for s, c in st.claims.items() if claim_stale(c)}
+    stale_lock = st.lock if (st.lock and lock_stale(st.lock)) else None
+    if args.lock_only:
+        stale_claims = {}
+    if not stale_claims and not stale_lock:
+        print("対象なし")
+        return
+    print("evict 候補:")
+    for s2, c in sorted(stale_claims.items()):
+        note = "" if worktree_exists(c) else " (worktree不在)"
+        print("  claim %s agent=%s 更新%s%s worktree=%s"
+              % (s2, c.get("agent"), fmt_age(c.get("refreshed_at")), note, c.get("worktree")))
+    if stale_lock:
+        print("  lock 保持者=%s/%s 取得%s"
+              % (stale_lock.get("agent"), stale_lock.get("slug"), fmt_age(stale_lock.get("acquired_at"))))
+    if args.dry_run:
+        print("--dry-run のため書き込みなし")
+        return
+    box = {"claims": [], "lock": False}
+
+    def precheck(st2):
+        return None
+
+    def mutate(st2):
+        # staleness を毎回再計算（CAS ループ中に持ち主が refresh/heartbeat したら対象から外す）
+        targets = {s3: c3 for s3, c3 in st2.claims.items()
+                   if s3 in stale_claims and claim_stale(c3)}
+        lk = st2.lock if (stale_lock and st2.lock and lock_stale(st2.lock)) else None
+        if not targets and lk is None:
+            box["claims"], box["lock"] = [], False
+            return []           # 全対象が消えていたら書き込まない
+        seq = st2.counter + 1
+        changes = []
+        ev = []
+        for s3, c3 in sorted(targets.items()):
+            changes.append(("del", "claims/%s.json" % s3))
+            ev.append({"agent": c3.get("agent"), "refreshed_at": c3.get("refreshed_at"), "slug": s3})
+        if lk is not None:
+            changes.append(("del", "locks/merge.json"))
+        obj = {"evicted": ev, "evicted_at": now_iso(), "kind": "evict",
+               "lock_evicted": lk is not None, "seq": seq}
+        changes.append(("put", "log/e%05d-evict.json" % seq, state_dumps(obj)))
+        changes.append(("put", "counter", ("%d\n" % seq).encode()))
+        box["claims"] = [(s3, targets[s3]) for s3 in sorted(targets)]
+        box["lock"] = lk is not None
+        return changes
+
+    res = write_state(precheck, mutate, lambda: "evict %d claims" % len(box["claims"]))
+    if res is None and not box["claims"] and not box["lock"]:
+        print("対象なし（CAS 中に延命された）")
+        return
+    for s3, c3 in box["claims"]:
+        print("evicted: claim %s (agent=%s)" % (s3, c3.get("agent")))
+    if box["lock"]:
+        print("evicted: merge lock")
+    paths = ", ".join(str(c3.get("worktree")) for _, c3 in box["claims"]) or "（なし）"
+    print("worktree と branch は残置: %s。片付けはユーザーに報告し指示を得てから行え。"
+          "未 push の作業が見えたら消すな" % paths)
+
+
+# ============================================================================
+# main
+# ============================================================================
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="agents", description="マルチAIセッション協調 CLI（agents-kit）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("directive", help="ユーザー指示原文を台帳に記録")
+    p.add_argument("text")
+    p.add_argument("--scope", default="")
+    p.add_argument("--supersedes", default="")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("start", help="claim + SHA固定 worktree + branch 作成")
+    p.add_argument("slug")
+    p.add_argument("--directive", required=True)
+    p.add_argument("--paths", required=True)
+    p.add_argument("--intent", required=True)
+    p.add_argument("--interfaces", default="")
+
+    p = sub.add_parser("sync", help="fetch + 状態表示 + claim 延命")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("status", help="表示のみ（fetch なし・オフライン可）")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("done", help="rebase → 全テスト → push → PR(任意)")
+    p.add_argument("--seen")
+
+    p = sub.add_parser("merge", help="直列化された唯一の main 反映経路")
+    p.add_argument("slug", nargs="?")
+    p.add_argument("--seen")
+    p.add_argument("--allow-lost-symbols", dest="allow_lost_symbols", default="")
+    p.add_argument("--reason", default="")
+
+    p = sub.add_parser("release", help="claim の自発的解放")
+    p.add_argument("slug", nargs="?")
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("evict", help="TTL 切れ claim / lock の掃除")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.add_argument("--lock-only", dest="lock_only", action="store_true")
+    return ap
+
+
+COMMANDS = {
+    "directive": cmd_directive, "start": cmd_start, "sync": cmd_sync,
+    "status": cmd_status, "done": cmd_done, "merge": cmd_merge,
+    "release": cmd_release, "evict": cmd_evict,
+}
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    CTX.cmd = args.cmd
+    CTX.json_mode = bool(getattr(args, "json", False))
+    try:
+        resolve_context()
+        COMMANDS[args.cmd](args)
+    except AgentsExit as e:
+        if e.msg:
+            if e.code == 8 and not CTX.json_mode:
+                print(e.msg)                    # exit 8 は stdout にも出す（§14）
+            print(e.msg, file=sys.stderr)
+        if not CTX.json_mode and args.cmd != "directive":
+            print(REMINDER)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+    if not CTX.json_mode and args.cmd != "directive":
+        print(REMINDER)                          # 固定リマインド行（§8.0）
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
