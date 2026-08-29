@@ -440,16 +440,31 @@ reconcile_checkout() {  # 手順8.5（§10）: ブートストラップ commit �
     echo "注意: ローカル $MAIN が remote と分岐している。自動では進めない（git pull --rebase 等で手動解消）"
     return 0
   fi
-  if [ -n "$(g status --porcelain -uno)" ]; then
-    echo "注意: 追跡ファイルに未コミット変更があるため checkout を自動で進めない。commit 後の git pull が .agents 等の未追跡ファイルに阻まれたら、それらを消してから pull せよ（内容は commit 済みで失われない）"
-    return 0
-  fi
-  restore_removed() {
+  # dirty な追跡ファイルは、内容が TIP の blob と同一（= install が配った更新そのもの）なら
+  # HEAD 版へ戻してから FF する（FF 後に TIP の内容へ戻るため無損失）。それ以外の dirty は中止。
+  local reverted="" xy
+  restore_all() {
     local r
     while IFS= read -r r; do
       [ -n "$r" ] && g cat-file blob "$TIP:$r" > "$T/$r"
-    done <<< "$removed"
+    done <<< "$removed
+$reverted"
   }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    xy="${line:0:2}"; f="${line:3}"
+    blob="$(g rev-parse -q --verify "$TIP:$f" 2>/dev/null || true)"
+    if [ "$xy" = " M" ] && [ -n "$blob" ] && [ "$(g hash-object "$T/$f")" = "$blob" ]; then
+      g checkout --quiet -- "$f" || { restore_all; echo "注意: $f を戻せず checkout の自動前進を中止（git pull を手で行え）"; return 0; }
+      reverted="$reverted$f
+"
+    else
+      restore_all
+      echo "注意: 追跡ファイルに未コミット変更（${line}）があるため checkout を自動で進めない。commit 後の git pull が .agents 等の未追跡ファイルに阻まれたら、それらを消してから pull せよ（内容は commit 済みで失われない）"
+      return 0
+    fi
+  done <<< "$(g status --porcelain -uno)"
+  restore_removed() { restore_all; }
   # FF を阻む未追跡ファイルのうち「remote 版と内容同一」のものだけを消す（FF 後に追跡状態で復活する）
   while IFS= read -r -d '' f; do
     if [ -e "$T/$f" ] && ! g ls-files --error-unmatch "$f" >/dev/null 2>&1; then
