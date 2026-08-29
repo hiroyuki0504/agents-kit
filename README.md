@@ -19,9 +19,9 @@
 - pre-push フック — main / agent-state への直接 push を拒否
 - origin に `agent-state` ブランチと、main に `.agents` 一式（自動 push）
 
-導入後に1つだけ手作業: `.agents/config.json` の `test_cmd` にテストコマンドを書いてください（例 `"pytest -q"`。テストが無いリポジトリは `"true"` と明示）。これを書くまで done / merge は動きません。
+導入後に1つだけ手作業: `.agents/config.json` の `test_cmd` にテストコマンドを書いてください（例 `"pytest -q"`。テストが無いリポジトリは `"true"` と明示）。これを書くまで done / merge は動きません。書いたら repo ルートで一度 `sh -c '<test_cmd>'` を実行し、**main の時点で素で通る**ことを確認してください（通らない test_cmd は全セッションの done / merge を止めます）。言語の生成物（`__pycache__` 等）は repo の `.gitignore` に入れておいてください（worktree に残ると done が停止します）。
 
-主 checkout は `git pull` で main を追いついておくと綺麗です（install が .agents を main に push するため）。
+導入クローンの checkout は install.sh が自動で main 最新に追いつかせます（追跡ファイルに未コミット変更がある場合などは案内だけ出して触りません）。
 
 ## 日常の使い方
 
@@ -77,5 +77,5 @@
 
 - `kit/agents` / `kit/PROTOCOL.md` — 配布物本体
 - `install.sh` — 導入スクリプト（冪等。再実行で kit を更新配布）
-- `tests/smoke.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh`）
+- `tests/smoke.sh` / `tests/breaker.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh && bash tests/breaker.sh`）
 - `SPEC.md` / `BRIEF.md` — 仕様と設計入力

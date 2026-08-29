@@ -7,6 +7,7 @@
 1. `.agents/bin/agents sync` を実行せよ。
 2. この文書を最後まで読め。
 3. ◆「ユーザーから指示の発言を受けたら、その発言があったターンの内に `agents directive "<発言の原文>"` で記録せよ。実装・調査・返答のどれよりも先に行え」
+4. 1つの発言に複数の依頼が含まれる場合は、依頼ごとに directive を分割し、各記録の text にはその依頼に該当する部分の原文を逐語で入れよ（分割すると文意が壊れる場合のみ 1 件で記録し、`--scope` に依頼を列挙せよ）。
 
 ## 2. 鉄則（5 条）
 
@@ -43,6 +44,8 @@
    ```
 
    期待出力: worktree の絶対パス・branch・base_sha。表示された他 claim の intent/interfaces を読み、意味の衝突が無いか判断せよ。
+   - 同じ directive を既に担当している claim が表示されたら、後追いの claim を取らずその担当に任せよ（同一指示の二重実装を防ぐ）。
+   - branch 名 `agent/<id>/<slug>` の id は **claim ごとに採番**される。同一セッションでも claim が変われば id は変わる。id からセッションの同一性を推定するな。
 
 4. 表示された worktree に `cd` して実装せよ。コミットは小さく分けよ。30 分ごと目安に worktree 内で `agents sync` を実行せよ（claim の延命は worktree 内での sync だけが行う）。
 
@@ -61,6 +64,8 @@
    ```
 
    merge はロック取得 → クリーン worktree でマージ → シンボル消失チェック → 全テスト → main push → 反映確認 → 後片付けを行う。
+   - merge は **ready な claim なら誰が実行してもよい**（done した本人でなくてよい。ロックと main push の FF 検査が安全を担保する）。
+   - ロック保持中で exit 4 になったら 30〜60 秒おきに再実行して待て（保持者の merge はテスト実行を含むため数分かかりうる）。
 
 ## 4. 異常系プレイブック（症状で引け）
 
@@ -73,12 +78,13 @@
 - **『ロックが奪取されていた / 奪取した』警告**: 手動修復不要。安全は main push の FF 検査が守る。テストが長い repo なら config の `merge_lock_ttl_min` をテスト所要の 2 倍以上に上げよ。
 - **rebase コンフリクト**: worktree 内で解消 → `git add` → `git rebase --continue` → 再度 `agents done`。
 - **テスト失敗**: push されていない。直してから再度 done / merge。
+- **テスト失敗の原因が自分の変更の外にある（既存の破損・他人の領域）**: まず sync で該当パスを担当する claim を確認。他者の claim 範囲なら待て（その担当の merge が直すことが多い）。誰の claim 範囲でもなければ、修正を directive として記録し、必要最小のパスで追加の claim を取って直せ（パス重複で拒否されたら待て）。迷ったらユーザーに 1 行で確認。
 - **done の branch push が失敗した**: そのまま再度 `agents done`（push 前に fetch するので自己回復する）。繰り返すなら stderr をユーザーに報告。
 - **自分の claim が evict されていた（exit 8）**: 作業を止めよ。sync → 生きている directive を確認 → 新しく start からやり直し、旧 branch から必要分を取り込む。旧 claim の slug が別セッションに再claim されていても、その claim・worktree・branch に触るな。
 - **start が途中で死んだ（claim はあるが worktree が無い）**: 自分のターミナルの事故だと確認できた場合のみ `agents release <slug> --force`。worktree が残っていれば中身を確認してから `git worktree remove`。確信が無ければユーザーに報告。
 - **worktree に agents.json が無い**: `git rev-parse --absolute-git-dir` 直下に `{"slug":...,"agent":...,"branch":...}` を手書きで復元してよい（agent と slug は branch 名 `agent/<agent>/<slug>` から逆引きできる）。
 - **merge が途中で死んだ**: もう一度 `agents merge <slug>` を実行すれば安全（push 済みなら回収経路が後片付けだけを行う）。残った `.worktrees/merge-*` は中身を確認し、ユーザーに報告してから消す。
-- **worktree が汚れていると言われた**: `git status` で確認。他セッションの残骸なら触らず報告。
+- **worktree が汚れていると言われた**: `git status` で確認。他セッションの残骸なら触らず報告。自分の worktree に生成物（`__pycache__` 等のビルド副産物）だけが残っている場合は、削除するか repo の `.gitignore` に追記せよ（コミットはするな）。`git worktree remove` が生成物だけで拒否される場合は `--force` でよい。
 - **長時間の離席から戻った**: 作業再開の前にまず worktree 内で `agents sync`。自分の claim が生きているか確認してから続きをせよ。
 
 ## 5. 後勝ちルール
@@ -113,6 +119,8 @@
 | `agents merge [<slug>] [--seen dNN]` | 直列化された唯一の main 反映経路 |
 | `agents release [<slug>] [--force]` | claim の自発的解放（branch と worktree は残る） |
 | `agents evict [--dry-run] [--lock-only]` | TTL 切れ claim / lock の掃除 |
+
+`--seen` は表示された**最大 seq を 1 つだけ**指定する（それ以下の全 directive を ack したことになる。自分が記録した directive は記録時点で ack 済み）。
 
 終了コード:
 

@@ -672,7 +672,9 @@ def directive_gate(st, slug, agent0, branch0, seen_arg, cmd_word):
         # 統合キャプチャで stderr が先に flush され、完成形コマンドが全文より先頭に現れる）
         print("上記を読み、自分の作業と矛盾しないか判断せよ。記録漏れの口頭指示があるなら先に "
               "agents directive で記録せよ。矛盾が無いと判断した場合のみ、"
-              "agents %s --seen %s で復唱して再実行" % (cmd_word, fmt_d(maxd)))
+              "agents %s --seen %s で復唱して再実行"
+              "（--seen は最大 seq を 1 つだけ指定。それ以下の全 directive を ack したことになる。"
+              "自分が記録した directive は記録時点で ack 済み）" % (cmd_word, fmt_d(maxd)))
         sys.stdout.flush()
         raise AgentsExit(3, None)
 
@@ -1294,7 +1296,8 @@ def cmd_done(args):
     dirty = _t(rs.stdout).strip()
     if dirty:
         print(dirty)
-        raise AgentsExit(3, "未コミットの変更がある。全てコミットせよ"
+        raise AgentsExit(3, "未コミットの変更がある。作業成果はコミットし、生成物"
+                            "（__pycache__ 等のビルド副産物）は削除するか repo の .gitignore に追記せよ"
                             "（rebase 途中ならば解消して git rebase --continue）")
     st = read_state()
     c = st.claims.get(slug)
@@ -1403,7 +1406,8 @@ def _lock_acquire(run, slug):
             return None
         remain = int((lk.get("ttl_min", CTX.cfg["merge_lock_ttl_min"])
                       - (age_minutes(lk.get("acquired_at")) or 0)))
-        return (4, "merge ロック保持者 %s/%s、残 %d 分。待って再実行"
+        return (4, "merge ロック保持者 %s/%s、残 %d 分。30〜60 秒おきに再実行して待て"
+                   "（保持者の merge はテスト実行を含むため数分かかりうる）"
                 % (lk.get("agent"), lk.get("slug"), max(remain, 0)))
 
     def mutate(st):
@@ -1556,7 +1560,10 @@ def cmd_merge(args):
                                     "repo の filter/EOL 設定を疑え（worktree: %s）" % wt)
 
             # 手順6: シミュレーション兼本マージ
-            rm = git(["merge", "--no-ff", "-m", "merge %s (%s): %s" % (slug, fmt_d(directive0), intent0), br],
+            # メッセージに seen を併記する（intent は claim 作成時の文言のまま固定されるため、
+            # 後勝ちで作り直された内容が入る場合の監査誤読を防ぐ。§4.6/運用実測より）
+            rm = git(["merge", "--no-ff", "-m",
+                      "merge %s (%s, seen %s): %s" % (slug, fmt_d(directive0), fmt_d(seen_ok), intent0), br],
                      cwd=wt)
             if rm.returncode != 0:
                 sys.stdout.write(_t(rm.stdout))
@@ -1656,7 +1663,8 @@ def cmd_merge(args):
         print("merged: %s → %s" % (merge_sha[:12], M()))
         print("PR があれば GitHub 上で自動的に merged になる")
         print("所有 worktree の片付け: 中身を確認し、未 push の変更が無いことを見てから "
-              "git worktree remove <claim worktree>")
+              "git worktree remove <claim worktree>"
+              "（生成物 __pycache__ 等だけが残って拒否される場合は --force でよい）")
     except AgentsExit:
         if locked:
             _unlock(run)
