@@ -6,7 +6,7 @@
 
 English version: [README.md](README.md)
 
-<!-- demo-gif -->
+![agents-kit デモ — claim競争・後勝ち・直列マージを自動検証](docs/demo.gif)
 
 1つの Git リポジトリに対し、別々のターミナルで動く複数の AI（Claude Code / Codex 混在、モデル・effort 任意）が、あなたの随時指示を受けながら**コンフリクトを起こさず並行実装**するための調整キットです。
 
