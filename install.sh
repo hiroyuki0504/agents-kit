@@ -535,6 +535,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "==== agents-kit 導入完了: $T ===="
+echo "健全性の確認: .agents/bin/agents doctor をいつでも実行できる（read-only の一括検査。--run-tests で main のテスト実走つき）"
 if [ "$CONFIG_CREATED" = "1" ]; then
   echo "(a) .agents/config.json の test_cmd を設定せよ。例:"
 else

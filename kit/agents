@@ -34,6 +34,8 @@ SYM_FILE_CAP = 1_000_000     # シンボル検査のファイルサイズ上限�
 DIRECTIVE_TAIL = 10          # sync の directive 表示件数
 GH_TIMEOUT = 3               # gh 呼び出しタイムアウト（秒）
 TEST_LOG_TAIL = 50           # テスト失敗時に再掲する末尾行数（実行自体は流しながら表示）
+GIT_MIN = (2, 30)            # doctor が検査する要求バージョン（§8.9。README 動作環境と同値）
+PY_MIN = (3, 9)
 
 # push 失敗分類の唯一の定義（§5.2/§5.3）。WRITE-STATE / merge 手順9 が共用し、
 # install.sh は bash のため同一パターン列を移植している（install.sh 内コメント参照。
@@ -270,7 +272,8 @@ def worktree_retry(args, cleanup=None):
 # 起動時共通処理（§8.0）
 # ============================================================================
 
-def resolve_context():
+def resolve_repo():
+    """git repo 検出と ROOT / COMMON_GITDIR の解決（§8.0 起動時共通処理の前半）。"""
     r = git_nocwd(["rev-parse", "--path-format=absolute", "--git-common-dir"])
     if r.returncode != 0:
         raise AgentsExit(3, "git リポジトリの中で実行せよ（git repo 外か bare）")
@@ -280,17 +283,23 @@ def resolve_context():
     CTX.common_gitdir = common
     CTX.root = common.parent
 
-    # config: <現worktreeのtoplevel>/.agents/config.json → ROOT/.agents/config.json
+
+def find_config_path():
+    """config の探索: <現worktreeのtoplevel>/.agents/config.json → ROOT/.agents/config.json。"""
     top = None
     rt = git_nocwd(["rev-parse", "--show-toplevel"])
     if rt.returncode == 0:
         top = Path(_t(rt.stdout).strip())
-    cfg_path = None
     for base in ([top] if top else []) + [CTX.root]:
         p = base / ".agents" / "config.json"
         if p.is_file():
-            cfg_path = p
-            break
+            return p
+    return None
+
+
+def resolve_context():
+    resolve_repo()
+    cfg_path = find_config_path()
     if cfg_path is None:
         raise AgentsExit(3, ".agents/config.json が無い。install.sh を実行せよ")
     try:
@@ -1810,6 +1819,324 @@ def cmd_evict(args):
           "未 push の作業が見えたら消すな" % paths)
 
 
+# ---------------------------------------------------------------------------
+# doctor（§8.9）— read-only preflight
+# ---------------------------------------------------------------------------
+
+class _Doctor:
+    """1 検査 1 行の ✔/✖/! 出力と問題数の集計。✖ だけを exit 3 の問題に数える。"""
+
+    def __init__(self):
+        self.problems = 0
+
+    def ok(self, msg):
+        print("✔ %s" % msg)
+
+    def bad(self, msg, fix=None):
+        self.problems += 1
+        print("✖ %s" % msg)
+        if fix:
+            print("  → %s" % fix)
+
+    def note(self, msg, fix=None):
+        print("! %s" % msg)
+        if fix:
+            print("  → %s" % fix)
+
+
+def _doctor_config(doc):
+    """検査(3): config の soft 読込。欠如/パース不能でも既定値で以降の検査を続行できるよう
+    CTX.cfg を必ず設定する（resolve_context と違い exit しない）。"""
+    cfg = dict(CONFIG_DEFAULTS)
+    err = None
+    unknown = []
+    cfg_path = find_config_path()
+    if cfg_path is None:
+        err = ".agents/config.json が無い"
+    else:
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                err = "config.json はオブジェクトであるべき: %s" % cfg_path
+            else:
+                unknown = sorted(k for k in raw if k not in CONFIG_DEFAULTS)
+                cfg.update({k: v for k, v in raw.items() if k in CONFIG_DEFAULTS})
+        except Exception as e:
+            err = "config.json のパースに失敗: %s (%s)" % (cfg_path, e)
+    CTX.cfg = cfg
+    if err:
+        doc.bad(err, "install.sh を実行せよ（以降の検査は既定値で続行する）")
+        return
+    good = True
+    if remote_url() == "":
+        doc.bad("config の remote '%s' が git remote に存在しない" % R(),
+                "git remote add %s <url> するか config.json の remote を直せ" % R())
+        good = False
+    # ブランチ名の文字集合は install.sh 手順1 と同じ制限（フック/JSON への安全な埋め込み）
+    bad_names = [b for b in (M(), S()) if not re.fullmatch(r"[A-Za-z0-9._/-]+", str(b))]
+    if bad_names:
+        doc.bad("ブランチ名に使えない文字が含まれる: %s（対応は [A-Za-z0-9._/-] のみ）"
+                % ", ".join(bad_names),
+                "ブランチ名を変えるか config.json を直し、install.sh を再実行せよ")
+        good = False
+    if good:
+        doc.ok("config.json OK（remote=%s main_branch=%s state_branch=%s）" % (R(), M(), S()))
+    if unknown:
+        doc.note("config.json に未知のキー: %s（無視される）" % ", ".join(unknown))
+
+
+def _doctor_run_tests(doc, m_sha):
+    """検査(7) --run-tests: origin/main 起点の一時 worktree で build+test を実走し、
+    成否によらず必ず片付ける。"""
+    wr = worktree_root_abs()
+    created_root = False
+    if not wr.is_dir():
+        try:
+            wr.mkdir(parents=True, exist_ok=True)
+            created_root = True
+        except OSError as e:
+            doc.bad("--run-tests: worktree_root を作成できない（%s）" % e,
+                    "worktree_root の権限/設定を確認せよ")
+            return
+    wt = wr / ("doctor-%s" % secrets.token_hex(3))
+
+    def cleanup():
+        git(["worktree", "remove", "--force", str(wt)])
+        git(["worktree", "prune"])
+
+    try:
+        worktree_retry(["worktree", "add", "--detach", str(wt), m_sha], cleanup=cleanup)
+    except AgentsExit as e:
+        doc.bad("--run-tests: 一時 worktree を作成できない: %s" % (e.msg or "").split("\n")[0],
+                "git worktree list で状態を確認せよ")
+        return
+    try:
+        fail = run_build_and_test(wt)
+        if fail:
+            doc.bad("テスト実走: 赤（origin/%s 時点で %s が失敗）" % (M(), fail),
+                    "main の時点で赤い test_cmd は全セッションの done/merge を止める。まず main を直せ")
+        else:
+            doc.ok("テスト実走: 緑（origin/%s 時点）" % M())
+    finally:
+        _worktree_remove(wt, warn_only=True)
+        if created_root:
+            try:
+                wr.rmdir()
+            except OSError:
+                pass
+
+
+def cmd_doctor(args):
+    """§8.9 read-only preflight。state を一切変更しない・push しない（remote へは
+    ls-remote / fetch の読み取りのみ。ローカル書き込みは一時ファイルと --run-tests の
+    一時 worktree だけで、終了時に必ず片付ける）。✖ が 1 つでもあれば exit 3。"""
+    doc = _Doctor()
+
+    # (1) git / python のバージョン（実バージョンを表示）
+    need_git = "%d.%d" % GIT_MIN
+    rv = git_nocwd(["--version"])
+    gtxt = _t(rv.stdout).strip()
+    mv = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", gtxt)
+    gver = tuple(int(x or 0) for x in mv.groups()) if mv else None
+    if gver is not None and gver >= GIT_MIN:
+        doc.ok("git %s（>= %s）" % (".".join(str(x) for x in gver), need_git))
+    else:
+        doc.bad("git のバージョンが要件未満か検出不能: %s（>= %s が必要）"
+                % (gtxt or "不明", need_git),
+                "git を %s 以上に更新せよ" % need_git)
+    pv = sys.version_info
+    if (pv[0], pv[1]) >= PY_MIN:
+        doc.ok("python %d.%d.%d（>= %d.%d）" % (pv[0], pv[1], pv[2], PY_MIN[0], PY_MIN[1]))
+    else:
+        doc.bad("python %d.%d は要件未満（>= %d.%d が必要）" % (pv[0], pv[1], PY_MIN[0], PY_MIN[1]),
+                "python3 を %d.%d 以上に更新せよ" % PY_MIN)
+
+    # (2) .agents 一式の存在と実行権
+    ag_bin = CTX.root / ".agents" / "bin" / "agents"
+    protocol = CTX.root / ".agents" / "PROTOCOL.md"
+    missing = [str(p) for p in (ag_bin, protocol) if not p.is_file()]
+    if missing:
+        doc.bad(".agents 一式が欠けている: %s" % ", ".join(missing), "install.sh を実行せよ")
+    elif not os.access(str(ag_bin), os.X_OK):
+        doc.bad(".agents/bin/agents に実行権が無い", "chmod +x %s（または install.sh を再実行）" % ag_bin)
+    else:
+        doc.ok(".agents 一式あり（bin/agents 実行可・PROTOCOL.md）")
+
+    # (3) config.json（soft 読込。欠如/パース不能でも既定値で以降の検査を続行）
+    _doctor_config(doc)
+
+    # (4) remote 到達性（ls-remote 1 回で到達性と main/state の存在を同時に得る）
+    url = remote_url()
+    reachable = False
+    have_main = have_state = False
+    if url == "":
+        doc.note("remote 到達性の検査はスキップ（remote 未解決）")
+    else:
+        rr = git(["ls-remote", R(), "refs/heads/%s" % M(), "refs/heads/%s" % S()])
+        if rr.returncode != 0:
+            err1 = _t(rr.stderr).strip().split("\n")[0]
+            doc.bad("remote %s（%s）に到達できない%s" % (R(), url, (": " + err1) if err1 else ""),
+                    "オフラインか、認証切れ・URL 誤りの可能性。回線と credential を確認せよ"
+                    "（未到達でも agents status 等のローカル操作は使える）")
+        else:
+            reachable = True
+            refs = set()
+            for line in _t(rr.stdout).split("\n"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    refs.add(parts[1])
+            have_main = ("refs/heads/%s" % M()) in refs
+            have_state = ("refs/heads/%s" % S()) in refs
+            doc.ok("remote %s に到達できた（%s）" % (R(), url))
+
+    # (5) origin の state_branch。あれば READ-STATE 相当で読む（(9)(11) が使う）
+    st = None
+    state_err = None
+    if not reachable:
+        doc.note("%s の %s 存在検査はスキップ（remote 未到達）" % (R(), S()))
+    elif have_state:
+        doc.ok("%s に %s がある" % (R(), S()))
+        try:
+            st = read_state()          # fetch + 巻き戻り検知 + 全読込（読み取りのみ）
+        except AgentsExit as e:
+            state_err = (e.msg or "読込失敗（詳細不明）").split("\n")[0]
+    else:
+        doc.bad("%s に %s が無い" % (R(), S()), "install.sh を実行せよ（agent-state を初期化する）")
+
+    # (6) origin の main_branch + 主 checkout との関係（info）
+    m_sha = None
+    if not reachable:
+        doc.note("%s の %s 存在検査はスキップ（remote 未到達）" % (R(), M()))
+    elif not have_main:
+        doc.bad("%s に %s が無い" % (R(), M()), "install.sh とブートストラップ push を確認せよ")
+    else:
+        try:
+            fetch_branch(M())
+            m_sha = rev_parse_q("refs/remotes/%s/%s" % (R(), M()))
+        except AgentsExit:
+            m_sha = None
+        head = rev_parse_q("HEAD")
+        if m_sha is None:
+            rel = "（主 checkout との関係は未確認 — fetch 失敗）"
+        elif head is None:
+            rel = "（主 checkout は unborn HEAD）"
+        elif head == m_sha:
+            rel = "（主 checkout は origin/%s と一致）" % M()
+        elif is_ancestor(head, m_sha):
+            n = _t(git(["rev-list", "--count", "%s..%s" % (head, m_sha)]).stdout).strip()
+            rel = "（主 checkout は %s コミット遅れ — 作業は worktree で行うため問題ではない）" % n
+        elif is_ancestor(m_sha, head):
+            n = _t(git(["rev-list", "--count", "%s..%s" % (m_sha, head)]).stdout).strip()
+            rel = "（主 checkout が %s コミット先行 — 未 push。main へは agents merge のみが反映できる）" % n
+        else:
+            rel = "（主 checkout は origin/%s と分岐している — 情報）" % M()
+        doc.ok("%s に %s がある%s" % (R(), M(), rel))
+
+    # (7) test_cmd（未設定は ✖）。--run-tests 時のみ origin/main の一時 worktree で実走
+    if not CTX.cfg.get("test_cmd"):
+        doc.bad("test_cmd 未設定（done/merge は拒否される）",
+                "config.json の test_cmd を設定せよ（テスト無しなら \"true\" と明示）")
+        if args.run_tests:
+            doc.note("--run-tests はスキップ（test_cmd 未設定）")
+    else:
+        extra = ("、build_cmd: %s" % CTX.cfg["build_cmd"]) if CTX.cfg.get("build_cmd") else ""
+        doc.ok("test_cmd 設定済み: %s%s" % (CTX.cfg["test_cmd"], extra))
+        if args.run_tests:
+            if m_sha is None:
+                doc.note("--run-tests はスキップ（origin/%s を取得できていない）" % M())
+            else:
+                _doctor_run_tests(doc, m_sha)
+
+    # (8) pre-push 防壁（§8.3 と同じ 4 点検査。repo 外 hooksPath は ! 警告）
+    hp_r = git(["config", "--get", "core.hooksPath"])
+    hp_raw = _t(hp_r.stdout).strip() if hp_r.returncode == 0 else ""
+    outside = False
+    if hp_raw:
+        # install.sh 手順6 と同じ判定: 絶対はそのまま/相対は ROOT 起点で realpath し、前綴比較
+        hp_abs = hp_raw if os.path.isabs(hp_raw) else str(CTX.root / hp_raw)
+        hp_real = os.path.realpath(hp_abs)
+        root_real = os.path.realpath(str(CTX.root))
+        outside = not (hp_real == root_real or hp_real.startswith(root_real + os.sep))
+    hook_file = effective_hook_dir() / "pre-push"
+    if hook_check_ok():
+        doc.ok("main 直 push 防壁 設置済み（%s）" % hook_file)
+    elif outside:
+        doc.note("main 直 push 防壁が無い/不整合（core.hooksPath が repo 外: %s。install.sh は書かない場所）"
+                 % hp_raw,
+                 "install.sh が表示するブロックを %s の先頭（shebang 直後）に手で前置せよ" % hook_file)
+    else:
+        doc.bad("main 直 push 防壁が実効フックパスに無い/不整合（%s）" % hook_file,
+                "install.sh を再実行せよ")
+
+    # (9) worktree_root の書き込み可否 + 孤児 worktree 数（info）
+    wr = worktree_root_abs()
+    probe = wr
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    if not os.access(str(probe), os.W_OK):
+        doc.bad("worktree_root が書き込み不可（%s）" % wr,
+                "ディレクトリの権限を直すか config.json の worktree_root を変えよ")
+    elif st is None:
+        doc.ok("worktree_root 書き込み可（%s。孤児 worktree の判定は state 未取得のため省略）" % wr)
+    else:
+        orphans = list_orphans(st)
+        if orphans:
+            doc.ok("worktree_root 書き込み可（%s）" % wr)
+            doc.note("孤児 worktree %d 件: %s" % (len(orphans), ", ".join(orphans)),
+                     "中身（未 push の作業）を確認し、ユーザーに報告してから片付けよ")
+        else:
+            doc.ok("worktree_root 書き込み可（%s、孤児 worktree なし）" % wr)
+
+    # (10) gh の有無（info）。GitHub remote なら branch protection の PR 必須（非互換）を検出
+    if shutil.which("gh") is None:
+        doc.note("gh 未検出（PR の自動作成は行われない。任意ツール）")
+    elif "github.com" not in url:
+        doc.ok("gh あり（remote が GitHub でないため PR 経路は不使用）")
+    else:
+        pr_required = None
+        r = gh_run(["api", "repos/{owner}/{repo}/branches/%s/protection" % M()])
+        if r is not None and r.returncode == 0:
+            try:
+                pr_required = bool(json.loads(_t(r.stdout)).get("required_pull_request_reviews"))
+            except Exception:
+                pr_required = None      # API 失敗は静かに info 扱い
+        if pr_required:
+            doc.bad("branch protection が %s への PR を必須にしている（agents merge の直接 push と非互換）"
+                    % M(),
+                    "Require a pull request before merging を外すか、自分を bypass に入れよ"
+                    "（推奨設定は install.sh の出力と PROTOCOL.md 付録）")
+        elif pr_required is False:
+            doc.ok("gh あり（branch protection の PR 必須なし）")
+        else:
+            doc.ok("gh あり（branch protection は未設定か確認不可 — 問題ではない）")
+
+    # (11) state の中身（stale merge lock / TTL 切れ claim は ! 情報表示）
+    if st is not None:
+        stale_lk = st.lock is not None and lock_stale(st.lock)
+        stale_cl = sorted(s for s, c in st.claims.items() if claim_stale(c))
+        if stale_lk:
+            doc.note("stale merge lock（保持者 %s/%s、取得 %s）"
+                     % (st.lock.get("agent"), st.lock.get("slug"), fmt_age(st.lock.get("acquired_at"))),
+                     "agents evict --dry-run で生死確認の上 agents evict --lock-only")
+        if stale_cl:
+            doc.note("TTL 切れ claim %d 件: %s" % (len(stale_cl), ", ".join(stale_cl)),
+                     "agents evict --dry-run で確認せよ（自分の別ターミナルが生きているかもしれない）")
+        if not stale_lk and not stale_cl:
+            doc.ok("state 正常（stale merge lock / TTL 切れ claim なし）")
+    elif state_err is not None:
+        doc.bad("agent-state を読めない: %s" % state_err,
+                "エラー全文は agents sync で再現して確認せよ")
+    else:
+        doc.note("state の中身の検査はスキップ（state 未取得）")
+
+    # 集計（固定リマインド行の直前）
+    print("")
+    if doc.problems:
+        print("doctor: 問題 %d 件" % doc.problems)
+        raise AgentsExit(3, None)
+    print("doctor: 問題なし")
+
+
 # ============================================================================
 # main
 # ============================================================================
@@ -1854,13 +2181,16 @@ def build_parser():
     p = sub.add_parser("evict", help="TTL 切れ claim / lock の掃除")
     p.add_argument("--dry-run", dest="dry_run", action="store_true")
     p.add_argument("--lock-only", dest="lock_only", action="store_true")
+
+    p = sub.add_parser("doctor", help="read-only の健全性検査（状態を一切変更しない）")
+    p.add_argument("--run-tests", dest="run_tests", action="store_true")
     return ap
 
 
 COMMANDS = {
     "directive": cmd_directive, "start": cmd_start, "sync": cmd_sync,
     "status": cmd_status, "done": cmd_done, "merge": cmd_merge,
-    "release": cmd_release, "evict": cmd_evict,
+    "release": cmd_release, "evict": cmd_evict, "doctor": cmd_doctor,
 }
 
 
@@ -1869,7 +2199,10 @@ def main(argv):
     CTX.cmd = args.cmd
     CTX.json_mode = bool(getattr(args, "json", False))
     try:
-        resolve_context()
+        if args.cmd == "doctor":
+            resolve_repo()       # doctor は config 欠如/破損も検査対象のため soft 読込（§8.9）
+        else:
+            resolve_context()
         COMMANDS[args.cmd](args)
     except AgentsExit as e:
         if e.msg:
