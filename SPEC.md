@@ -467,7 +467,7 @@ C/C++ は正規表現での関数定義抽出が不安定なため v1 では対�
 |---|---|
 | 0 | 成功 |
 | 2 | 引数・使い方の誤り（argparse 既定） |
-| 3 | 前提不成立（config 不足、claim worktree 外、dirty、未 ack directive、install 未実行） |
+| 3 | 前提不成立（config 不足、claim worktree 外、dirty、未 ack directive、install 未実行）。`doctor` は検査で問題（✖）を 1 件以上検出したときこの code を返す（§8.9） |
 | 4 | 競合（slug 使用中、パス重複、merge ロック保持中、マージコンフリクト） |
 | 5 | リトライ上限（CAS 10 回 / merge 再走 2 回）。stderr 全文を表示 |
 | 6 | 外部コマンド失敗（git 致命エラー、build/test 失敗、worktree 作成失敗、state 巻き戻り検知） |
@@ -596,6 +596,28 @@ claim の自発的解放（成果を捨てる/作り直す時。branch と workt
 2. `--dry-run` は一覧表示のみで exit 0。`--lock-only` は stale lock だけを対象にする（sync の stale lock 警告はこちらを案内する。claim を巻き込まない）。
 3. WRITE-STATE（msg = `evict N claims`）: precheck 内で staleness を**毎回再計算**し（CAS ループ中に持ち主が refresh/heartbeat したら対象から外す）、残った対象の claim ファイル・lock を削除 + `log/e%05d-evict.json` 追加。全対象が消えていたら書き込まず exit 0。
 4. 出力: evict した slug/agent の一覧と「worktree と branch は残置: <paths>。**片付けはユーザーに報告し指示を得てから行え。未 push の作業が見えたら消すな**」（実敗 #3 の教訓: 他人の未コミット作業を無言で消さない）。固定リマインド行。
+
+### 8.9 `agents doctor [--run-tests]`
+
+read-only の健全性検査（preflight）。導入直後・障害調査・オフライン復帰時に、環境と設定が壊れていないかを一括で確かめる。**state を一切変更しない**: WRITE-STATE を呼ばず、push もしない。remote へは読み取り（`ls-remote` / fetch）のみ。ローカルへの書き込みは一時ファイルだけ（`--run-tests` の一時 worktree を含む。終了時に必ず除去する）。どこで実行してもよい（git repo 外・bare は他コマンドと同じく exit 3）。
+
+起動時共通処理の config 読込だけは例外で、**config 欠如/パース不能でも exit せず**（それ自体が検査対象のため）、✖ を出して既定値（§8.0）で以降の検査を続行する。
+
+検査項目と表示（1 検査 1 行。`✔` = 合格、`✖` = 問題 — 直後に修正アクション行 `  → ...` を伴う、`!` = 情報/警告 — **問題数に数えない**）:
+
+1. **git >= 2.30 / python >= 3.9**（実バージョンを表示。未満・検出不能は ✖）。
+2. **`.agents` 一式**: `ROOT/.agents/bin/agents` の存在+実行 bit、`ROOT/.agents/PROTOCOL.md` の存在。欠如は ✖「install.sh を実行せよ」。
+3. **config.json**: パースでき、`remote` が `git remote` の URL に解決し、`main_branch` / `state_branch` が §10 手順 1 の文字集合 `[A-Za-z0-9._/-]` に収まる。未知キーは `!`。
+4. **remote 到達性**: `git ls-remote R refs/heads/M refs/heads/S` 1 回で到達性と両 ref の存在を同時に得る。失敗は ✖ + オフライン示唆（stderr 先頭行を併記）で**続行**し、依存する検査 5/6/11 は `!` スキップ表示にする。
+5. **origin に state_branch が存在**（無ければ ✖「install.sh を実行せよ」）。存在すれば READ-STATE 相当で state を読む（fetch + 巻き戻り検知 + 全読込。検査 9/11 が使う。読めない場合は 11 が ✖）。
+6. **origin に main_branch が存在**（無ければ ✖「install.sh とブートストラップ push を確認せよ」）。存在すれば fetch main し、主 checkout HEAD との関係（一致 / n コミット遅れ / n コミット先行 / 分岐 / unborn）を info として同じ行に併記（すべて情報であり ✖ にしない）。
+7. **test_cmd 設定済み**（未設定は ✖。文言は §8.5 手順 6 と同じ）。`--run-tests` 指定時のみ: `refs/remotes/R/M` を起点に `ROOT/<worktree_root>/doctor-<token>` へ detach worktree を作り build_cmd → test_cmd を実走（出力は §8.0 の tee 方式）、緑 ✔ / 赤 ✖ を報告し、**成否によらず worktree を除去**する（worktree_root をこのために作った場合は空なら除去）。test_cmd 未設定・origin/main 未取得時の `--run-tests` は `!` スキップ。
+8. **pre-push 防壁**: 実効フックパスの `pre-push` を §8.3 と同一の 4 点検査（マーカー・両ブランチ名・到達可能性・ブロック単体セルフテスト）。不合格は ✖「install.sh を再実行せよ」。ただし `core.hooksPath` が repo 外（install.sh 手順 6 と同じ realpath 前綴判定）の場合、不合格は ✖ でなく `!`（install.sh が書かない場所のため。手動前置を案内）。repo 外でもブロックが手動前置済みで 4 点検査に通れば ✔。
+9. **worktree_root**: 書き込み可否（不可は ✖。未作成なら最も近い存在する祖先で判定）と孤児 worktree 数（0 件は ✔ に併記、1 件以上は `!` + §8.3 と同じ片付け文言。state 未取得時は判定省略を併記）。
+10. **gh の有無**（無しは `!` info。remote が GitHub 以外なら有無のみ）。gh があり remote が GitHub のとき `gh api repos/{owner}/{repo}/branches/M/protection`（GH_TIMEOUT 秒）で `required_pull_request_reviews` を検出したら ✖（§11 章 8 の非互換設定）。API 失敗（未設定 404・権限不足・タイムアウト）は静かに info 扱い（✖ にしない）。
+11. **state の中身**（検査 5 で読めたとき）: stale merge lock / TTL 切れ claim を `!` で表示（対応コマンドの文言は §8.3 の警告と同じ）。どちらも無ければ ✔。state が存在するのに読めない（パース不能・巻き戻り検知）は ✖（メッセージ先頭行を併記）。
+
+出力の最後（固定リマインド行の直前）に空行 + 集計行: `doctor: 問題 N 件`（N = ✖ の数）で **exit 3**、✖ が 0 なら `doctor: 問題なし` で **exit 0**。`--json` は持たない。固定リマインド行。
 
 ---
 

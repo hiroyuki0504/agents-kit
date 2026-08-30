@@ -293,6 +293,60 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (8) doctor: read-only preflight
+#     健全 repo で exit 0 / test_cmd 未設定で exit 3 + ✖ 行 / --run-tests の片付け /
+#     実行前後で origin の main と agent-state の SHA が不変（read-only 性）
+# ---------------------------------------------------------------------------
+STATE_BEFORE="$(G ls-remote origin refs/heads/agent-state | awk '{print $1}')"
+MAIN_BEFORE="$(G ls-remote origin refs/heads/main | awk '{print $1}')"
+
+DOC1_OUT="$SB/doctor1.out"
+"$AG" doctor > "$DOC1_OUT" 2>&1
+RC=$?
+if [ $RC -eq 0 ] && grep -q "doctor: 問題なし" "$DOC1_OUT"; then
+  ok "(8a) 健全 repo で doctor が exit 0（問題なし）"
+else
+  ng "(8a) doctor が exit 0 + 問題なしにならない (rc=$RC)" "$(cat "$DOC1_OUT")"
+fi
+
+cp "$SB/repo/.agents/config.json" "$SB/config.bak"
+python3 - "$SB/repo/.agents/config.json" <<'EOF'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["test_cmd"] = None
+open(p, "w").write(json.dumps(cfg, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+EOF
+DOC2_OUT="$SB/doctor2.out"
+"$AG" doctor > "$DOC2_OUT" 2>&1
+RC=$?
+if [ $RC -eq 3 ] && grep -q "✖ test_cmd 未設定" "$DOC2_OUT" && grep -q "doctor: 問題 1 件" "$DOC2_OUT"; then
+  ok "(8b) test_cmd 未設定の doctor が exit 3（✖ 行と件数つき）"
+else
+  ng "(8b) test_cmd 未設定の doctor が exit 3 + ✖ 行にならない (rc=$RC)" "$(cat "$DOC2_OUT")"
+fi
+cp "$SB/config.bak" "$SB/repo/.agents/config.json"
+
+DOC3_OUT="$SB/doctor3.out"
+"$AG" doctor --run-tests > "$DOC3_OUT" 2>&1
+RC=$?
+DOC_LEFT="$(ls -d "$SB/repo/.worktrees"/doctor-* 2>/dev/null)"
+if [ $RC -eq 0 ] && grep -q "テスト実走: 緑" "$DOC3_OUT" && [ -z "$DOC_LEFT" ]; then
+  ok "(8c) doctor --run-tests が緑を報告し一時 worktree を片付けた"
+else
+  ng "(8c) doctor --run-tests が失敗/片付け漏れ (rc=$RC left=$DOC_LEFT)" "$(tail -n 15 "$DOC3_OUT")"
+fi
+
+STATE_AFTER="$(G ls-remote origin refs/heads/agent-state | awk '{print $1}')"
+MAIN_AFTER="$(G ls-remote origin refs/heads/main | awk '{print $1}')"
+if [ -n "$STATE_BEFORE" ] && [ -n "$MAIN_BEFORE" ] \
+   && [ "$STATE_BEFORE" = "$STATE_AFTER" ] && [ "$MAIN_BEFORE" = "$MAIN_AFTER" ]; then
+  ok "(8d) doctor 前後で origin の main / agent-state が不変（read-only）"
+else
+  ng "(8d) doctor が origin を変更した" "state: $STATE_BEFORE -> $STATE_AFTER" "main: $MAIN_BEFORE -> $MAIN_AFTER"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果
 # ---------------------------------------------------------------------------
 echo ""
