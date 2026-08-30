@@ -1,14 +1,32 @@
 # agents-kit — 複数AIセッション並行開発キット
 
+[![tests](https://github.com/hiroyuki0504/agents-kit/actions/workflows/tests.yml/badge.svg)](https://github.com/hiroyuki0504/agents-kit/actions/workflows/tests.yml)
+
+**English** — agents-kit lets multiple AI coding sessions (Claude Code / Codex, any mix of models) implement in parallel on **one Git repository without conflicts**. Coordination runs on git alone, with no AI-vendor-specific features: an orphan `agent-state` branch on origin is the shared ledger (git push's fast-forward check acts as compare-and-swap), user instructions are recorded as totally-ordered directives where **the newest instruction wins**, and every merge to main goes through a single serialized `agents merge` path — fresh worktree, merge simulation, symbol-loss check, and a full test run per merge. A local pre-push hook physically blocks direct pushes to main.
+
+Quick start: `./install.sh /path/to/your-repo`, set `test_cmd` in `.agents/config.json`, then tell each AI session **"Read .agents/PROTOCOL.md and follow it."** — that's all.
+
+Documentation and CLI messages are in Japanese. The primary readers are AI agents, which handle this natively; this README covers everything a human operator needs.
+
+---
+
 1つの Git リポジトリに対し、別々のターミナルで動く複数の AI（Claude Code / Codex 混在可）が、あなたの随時指示を受けながら**コンフリクトを起こさず並行実装**するための調整キットです。
 
 仕組みは git だけで完結します（AI 固有機能に依存しない）。調整情報は origin 上の専用ブランチ `agent-state` に記録され、main へのマージは直列化された `agents merge` コマンドだけが行います。main への直接 push はローカルフックが物理的に拒否します。
+
+## 動作環境
+
+- git 2.30+ / python3 3.9+（標準ライブラリのみ）/ POSIX sh + bash（macOS 標準の bash 3.2 で動作確認済み）
+- 任意: `gh`（GitHub CLI）— ある場合のみ `done` が PR を自動作成します（無くても全機能動作）
+- CI: ubuntu-latest / macos-latest で `tests/smoke.sh`（29検査）+ `tests/breaker.sh`（14検査）を実行
 
 ## 導入（リポジトリごとに1回）
 
 ```
 ./install.sh /path/to/your-repo
 ```
+
+push 前に何が入るか確認したい場合は `./install.sh /path/to/your-repo --no-push`（origin への自動 push を保留します。内容を確認したら `--no-push` 無しで再実行すると push されます）。
 
 これで対象リポジトリに以下が入ります。
 
@@ -79,3 +97,8 @@
 - `install.sh` — 導入スクリプト（冪等。再実行で kit を更新配布）
 - `tests/smoke.sh` / `tests/breaker.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh && bash tests/breaker.sh`）
 - `SPEC.md` / `BRIEF.md` — 仕様と設計入力
+- `.github/workflows/tests.yml` — CI（ubuntu / macos で全テスト）
+
+## ライセンス / License
+
+MIT — [LICENSE](LICENSE) を参照。

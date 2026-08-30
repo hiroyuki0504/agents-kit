@@ -4,6 +4,7 @@
 
 SPEC.md 完全準拠の単一ファイル実装。標準ライブラリのみ（python 3.9+ / git 2.30+）。
 調整媒体は origin 上の orphan ブランチ agent-state。全状態変更は WRITE-STATE（CAS）を通る。
+プロジェクト: https://github.com/hiroyuki0504/agents-kit（MIT License）
 """
 
 import argparse
