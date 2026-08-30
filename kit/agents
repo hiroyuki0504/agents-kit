@@ -38,8 +38,9 @@ GIT_MIN = (2, 30)            # doctor が検査する要求バージョン（§8
 PY_MIN = (3, 9)
 
 # push 失敗分類の唯一の定義（§5.2/§5.3）。WRITE-STATE / merge 手順9 が共用し、
-# install.sh は bash のため同一パターン列を移植している（install.sh 内コメント参照。
-# 変更時は install.sh の AGENTS_KIT_CAS_PATTERNS も同時に更新すること）。
+# install.sh は bash のため同一パターン列を移植している（install.sh 内コメント参照）。
+# uninstall.sh も AGENTS_KIT_CAS_PATTERNS を持つが、あちらは恒久拒否をリトライしないための
+# 意図的な部分集合（根拠は uninstall.sh 内コメント）。変更時は両方を同時に確認すること。
 PUSH_CAS_PATTERNS = [
     r"\[rejected\]", r"non-fast-forward", r"fetch first",
     r"\[remote rejected\]", r"incorrect old value",

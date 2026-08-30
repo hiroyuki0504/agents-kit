@@ -1,5 +1,16 @@
 # PROGRESS — agents-kit
 
+## 2026-08-31 v1.1.0 — 英語圏対応と実用性強化
+
+(English summary: v1.1.0 adds an English-first README, a self-verifying local demo `demo.sh`, an `agents doctor` preflight, `uninstall.sh` plus a 32-check suite, contributor docs, and a 4-step CI. The v1.0 live-run record below is in Japanese; the README's "Born from 8 real failures" table is its English distillation.)
+
+- README.md を英語主体に全面リライト（実敗8件の表・mermaid図・FAQ）、README.ja.md（日本語完全版）を新設。
+- `demo.sh`: AI・ネットワーク不要で claim競争→後勝ち→seenゲート→直列マージの全物語を実演・自動検証（13アサート・約5秒）。CIにも組み込み。
+- `agents doctor`: read-only の健全性検査11項目（SPEC §8.9）。smoke に4検査追加（計33）。install.sh 完了時に案内。
+- `uninstall.sh`: マーカーベースの完全撤去（agent-state 台帳は既定で保持、--purge-remote で削除）+ tests/uninstall.sh（32検査）。
+- CONTRIBUTING / issue・PRテンプレート新設。CI は smoke 33 + breaker 14 + uninstall 32 + demo の4ステップ（ubuntu / macos）。
+- 開発手順: 5本の隔離worktreeで並列ビルド → squash統合 → 敵対レビュー2系統（blocker 0・新規コンテンツの漏えいゼロ）→ 全スイート緑を確認して公開。
+
 ## 2026-08-31 OSS公開（v1.0.0）
 
 - https://github.com/hiroyuki0504/agents-kit として public 公開（MIT License）。

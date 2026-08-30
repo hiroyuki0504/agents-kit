@@ -21,7 +21,7 @@ set -u
 # ---------------------------------------------------------------------------
 for dep in git python3; do
   command -v "${dep}" >/dev/null 2>&1 || {
-    echo "demo.sh: missing dependency: ${dep} (see README「動作環境」)" >&2
+    echo "demo.sh: missing dependency: ${dep} (see Requirements in README.md / README.ja.md の「動作環境」)" >&2
     exit 1
   }
 done

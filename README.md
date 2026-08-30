@@ -8,7 +8,9 @@
 
 <!-- demo-gif -->
 
-Run multiple AI coding sessions — Claude Code and Codex side by side, any mix of models and effort levels — against **one Git repository, in parallel, without conflicts**, while you keep giving instructions to whichever session you like. Coordination is plain git, end to end: an orphan `agent-state` branch on origin is the shared ledger (the fast-forward check of `git push` doubles as compare-and-swap), your instructions become totally-ordered directives where **the newest one wins**, and main only ever moves through a single serialized merge path that runs the full test suite per merge. No AI-vendor features, no required GitHub services — any git remote works.
+Run multiple AI coding sessions — Claude Code and Codex side by side, any mix of models and effort levels — against **one Git repository, in parallel, without conflicts**, while you keep giving instructions to whichever session you like.
+
+Coordination is plain git, end to end: an orphan `agent-state` branch on origin is the shared ledger (the fast-forward check of `git push` doubles as compare-and-swap), your instructions become totally-ordered directives where **the newest one wins**, and main only ever moves through a single serialized merge path that runs the full test suite per merge. No AI-vendor features, no required GitHub services — any git remote works.
 
 *The AI-facing protocol and CLI messages are in Japanese — the AIs read them natively. This README covers everything a human operator needs; see the [FAQ](#faq).*
 
@@ -45,7 +47,7 @@ flowchart LR
 - **One merge path, fully serialized.** Only `agents merge` can advance main: take the global merge lock → simulate the merge in a fresh clean worktree → check that no symbols silently vanished → run the full test suite on the exact merge commit → fast-forward push that same commit. If main moved in the meantime, re-merge and re-test against the new main.
 - **A pre-push hook as the physical barrier.** Direct pushes to main and agent-state are rejected locally (the hook is installed at the effective hooks path; `core.hooksPath` is respected). The merge lock is an optimization — the safety comes from the FF check on the final push.
 
-Beyond the automated suites, v1 was exercised end-to-end on a real GitHub repository with three AI sessions in parallel (different models and effort levels): all nine success criteria passed with zero protocol violations. The run record is in [PROGRESS.md](PROGRESS.md).
+Beyond the automated suites, v1 was exercised end-to-end on a real GitHub repository with three AI sessions in parallel (different models and effort levels): all nine success criteria passed with zero protocol violations. The run record is in [PROGRESS.md](PROGRESS.md) (in Japanese; the failure table above is its English distillation).
 
 ## Quick start
 
@@ -59,10 +61,10 @@ cd agents-kit
 
 This installs into the target repo: the coordination CLI (`.agents/bin/agents`, python3 stdlib only), the protocol the AIs follow (`.agents/PROTOCOL.md`), a clone-local `.agents/config.json` (never committed), pointer blocks in `AGENTS.md` / `CLAUDE.md` (appended to existing files, created otherwise), a pre-push hook that rejects direct pushes to main / agent-state, and — pushed automatically — the `agent-state` branch on origin plus the `.agents` payload on main. The installer is idempotent; rerun it to roll out kit updates. It also fast-forwards the install clone's checkout to the new main when that is safe (with uncommitted changes to tracked files it only prints guidance and touches nothing). To review everything before it reaches origin: `./install.sh /path/to/your-repo --no-push`, then rerun without the flag to push.
 
-**One manual step** — set your test command in `/path/to/your-repo/.agents/config.json`:
+**One manual step** — open `/path/to/your-repo/.agents/config.json` (the installer wrote it, with `main_branch` already detected) and set the `test_cmd` key, keeping the rest of the file as is:
 
 ```json
-{ "test_cmd": "pytest -q" }
+"test_cmd": "pytest -q"
 ```
 
 `test_cmd` is required — `done` and `merge` refuse to run until it is set. If the repo has no tests, state that explicitly with `"test_cmd": "true"`. Run the command once at the repo root and confirm it passes on plain main (a failing `test_cmd` blocks done/merge for **every** session), and make sure build artifacts (`__pycache__` and friends) are in the repo's `.gitignore` — leftovers in a worktree stop `done`.
@@ -170,14 +172,15 @@ Layout of this repository:
 
 - `kit/agents`, `kit/PROTOCOL.md` — the distributed payload (coordination CLI + the protocol the AIs follow)
 - `install.sh` — installer (idempotent; rerun to roll out kit updates), `uninstall.sh` — remover, `demo.sh` — self-verifying local demo
-- `tests/smoke.sh`, `tests/breaker.sh` — end-to-end and adversarial suites against a local bare origin (no network, no gh)
+- `tests/smoke.sh`, `tests/breaker.sh`, `tests/uninstall.sh` — end-to-end, adversarial, and uninstall suites against a local bare origin (no network, no gh)
 - `SPEC.md` — the full v1 specification; `BRIEF.md` — the design input, including the eight failures
-- `.github/workflows/tests.yml` — CI: both suites on ubuntu-latest and macos-latest
+- `.github/workflows/tests.yml` — CI: all three suites plus `demo.sh` on ubuntu-latest and macos-latest
 
 Run the tests:
 
 ```sh
-bash tests/smoke.sh && bash tests/breaker.sh   # 29 + 14 checks, all local
+bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh   # 33 + 14 + 32 checks, all local
+bash demo.sh                                   # the full coordination story, self-verified
 ```
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
