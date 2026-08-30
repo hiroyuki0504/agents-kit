@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/uninstall.sh — uninstall.sh のエンドツーエンド自動検証。
 # mktemp -d 配下に「ローカル bare origin + クローン」の sandbox をシナリオごとに作り、
-# 撤去の契約 (a)〜(f) と claim 生存ゲート (g) を検証する。
+# 撤去の契約 (a)〜(f)、claim 生存ゲート (g)、hooksPath/--no-push/remote 障害・push 拒否系 (h)〜(l) を検証する。
 # set -e は使わず PASS/FAIL を数え、全 PASS で exit 0。gh には依存しない。
 set -u
 

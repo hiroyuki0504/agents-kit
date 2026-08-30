@@ -26,7 +26,11 @@ jobs:
           git --version
           python3 --version
           bash --version | head -1
-      - name: smoke (29 checks)
+      - name: smoke (33 checks)
         run: bash tests/smoke.sh
       - name: breaker (14 checks)
         run: bash tests/breaker.sh
+      - name: uninstall (32 checks)
+        run: bash tests/uninstall.sh
+      - name: demo (self-verifying)
+        run: bash demo.sh

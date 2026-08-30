@@ -1,6 +1,6 @@
 #!/bin/bash
 # tests/smoke.sh — agents-kit のエンドツーエンド自動検証。
-# mktemp -d 配下にローカル bare origin + クローンの sandbox を作り、7 項目を検証する。
+# mktemp -d 配下にローカル bare origin + クローンの sandbox を作り、8 項目を検証する。
 # set -e は使わず PASS/FAIL を数え、全 PASS で exit 0。gh には依存しない
 # （remote が github.com を含まないため PR 経路は自動スキップされる）。
 set -u

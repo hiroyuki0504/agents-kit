@@ -51,7 +51,7 @@ flowchart LR
 
 - git 2.30+ / python3 3.9+（標準ライブラリのみ）/ POSIX sh + bash（macOS 標準の bash 3.2 で動作確認済み）
 - 任意: `gh`（GitHub CLI）— ある場合のみ `done` が PR を自動作成します（無くても全機能動作）
-- CI: ubuntu-latest / macos-latest で `tests/smoke.sh`（29検査）+ `tests/breaker.sh`（14検査）を実行
+- CI: ubuntu-latest / macos-latest で `tests/smoke.sh`（33検査）+ `tests/breaker.sh`（14検査）+ `tests/uninstall.sh`（32検査）+ `demo.sh` を実行
 
 ## 導入（リポジトリごとに1回）
 
@@ -184,7 +184,7 @@ claim には TTL があります（既定 24 時間。worktree 内の `agents sy
 
 - `kit/agents` / `kit/PROTOCOL.md` — 配布物本体（調整 CLI + AI が従う規約）
 - `install.sh` — 導入スクリプト（冪等。再実行で kit を更新配布）、`uninstall.sh` — 撤去スクリプト、`demo.sh` — 自動検証つきローカルデモ
-- `tests/smoke.sh` / `tests/breaker.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh && bash tests/breaker.sh`）
+- `tests/smoke.sh` / `tests/breaker.sh` / `tests/uninstall.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh`）
 - `SPEC.md` / `BRIEF.md` — 仕様と設計入力
 - `.github/workflows/tests.yml` — CI（ubuntu / macos で全テスト）
 

@@ -762,7 +762,7 @@ rm -f "$agents_kit_tmp"
 
 ## 14. 実装ノート
 
-- 定数（スクリプト先頭に集約）: `CAS_MAX=10`, `CAS_SLEEP=uniform(0.2,1.0)+0.1*attempt`, `FETCH_RETRY=5`, `FETCH_SLEEP=uniform(0.1,0.5)`, `MERGE_RESTART_MAX=2`（初回+再走 2）, `PUSH_CAS_PATTERNS`（§5.2 の 7 パターン。push 失敗分類の唯一の定義とし、WRITE-STATE / merge 手順 9 / install.sh から共用）, `RECOVERY_SCAN=1000`（4b の first-parent 走査上限）, `SYM_FILE_CAP=1_000_000` bytes, `DIRECTIVE_TAIL=10`, `REFRESH_FRACTION=claim_ttl/4`, `GH_TIMEOUT=3s`, `TEST_LOG_TAIL=50` 行（失敗表示用。実行自体はチャンク単位の無遅延 tee で流す。§8.0。(impl-fix)）, `REMINDER`（§8.0 の固定リマインド行の文字列）。
+- 定数（スクリプト先頭に集約）: `CAS_MAX=10`, `CAS_SLEEP=uniform(0.2,1.0)+0.1*attempt`, `FETCH_RETRY=5`, `FETCH_SLEEP=uniform(0.1,0.5)`, `MERGE_RESTART_MAX=2`（初回+再走 2）, `PUSH_CAS_PATTERNS`（§5.2 の 7 パターン。push 失敗分類の唯一の定義とし、WRITE-STATE / merge 手順 9 / install.sh から共用）, `RECOVERY_SCAN=1000`（4b の first-parent 走査上限）, `SYM_FILE_CAP=1_000_000` bytes, `DIRECTIVE_TAIL=10`, `REFRESH_FRACTION=claim_ttl/4`, `GH_TIMEOUT=3s`, `TEST_LOG_TAIL=50` 行（失敗表示用。実行自体はチャンク単位の無遅延 tee で流す。§8.0。(impl-fix)）, `REMINDER`（§8.0 の固定リマインド行の文字列）, `GIT_MIN=(2,30)` / `PY_MIN=(3,9)`（§8.9 doctor の要求バージョン下限。README 動作環境と同値）。
 - すべての git 呼び出しは `subprocess.run([...], capture_output=..., env={**os.environ, "LC_ALL": "C", "LANG": "C"})`。トークン（`AGENTS_STATE_TOKEN` / `AGENTS_MERGE_TOKEN`）は該当 push の env にだけ足す。シェル経由は build/test の `sh -c` のみ。
 - `read-tree` の引数は `<tip>^{tree}`（リテラル波括弧）。zsh 等の展開問題はスクリプト内 exec なので無関係。
 - WRITE-STATE の一時 index 置き場 `COMMON_GITDIR/agents-tmp/` は初回に mkdir -p。プロセス異常終了で残ったファイルは起動時に 24h より古いものを黙って削除（軽量 GC。これ以外の自動 GC はしない。孤児 worktree は sync の一覧表示＝人間判断に委ねる）。
