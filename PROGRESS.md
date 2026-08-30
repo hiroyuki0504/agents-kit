@@ -1,5 +1,13 @@
 # PROGRESS — agents-kit
 
+## 2026-08-31 OSS公開（v1.0.0）
+
+- https://github.com/hiroyuki0504/agents-kit として public 公開（MIT License）。
+- 追加: LICENSE / README 英語イントロ+CIバッジ+動作環境+`--no-push` 案内 / GitHub Actions CI（ubuntu+macos で smoke+breaker 全検査）/ 配布物への出自ヘッダ / install.sh の python3 fail-fast ガード。
+- breaker (1) の同時claim競争を×10→×20に引き上げ（BRIEF/SPEC の成功基準「20回」と実装を一致させた）。
+- 公開前監査: 読み取り専用の敵対監査2系統（情報漏えい / 第三者ユーザビリティ、全12ファイル精読）で blocker 0・秘密情報/個人情報/私的文脈の漏えいゼロを確認。指摘4件は全て本公開コミットで反映。
+- git履歴は全コミット author/committer = `Claude <noreply@anthropic.com>` で私的情報ゼロのため、フル履歴のまま公開。
+
 ## 2026-08-30 v1 完成（設計→実装→実GitHub実証まで完了）
 
 ### これは何か
@@ -12,7 +20,7 @@
 - main / agent-state への直接pushはpre-pushフックが拒否（core.hooksPath対応、既存フックの先頭に前置）。
 
 ### 検証状態
-- tests/smoke.sh 29検査 + tests/breaker.sh 14検査 全PASS（ローカルbare origin。同時claim×10、merge途中kill回収、ゾンビexit 8、stale lock奪取、master既定repo、敵対的既存フック等）。
+- tests/smoke.sh 29検査 + tests/breaker.sh 14検査 全PASS（ローカルbare origin。同時claim×20、merge途中kill回収、ゾンビexit 8、stale lock奪取、master既定repo、敵対的既存フック等）。
 - 実GitHub実証: private repo `hiroyuki0504/agents-kit-sandbox` で3並列AIセッション（fable/high・sonnet/medium・fable/low）が生シミュレーション。**9基準全PASS・プロトコル違反ゼロ**（後勝ち実行・seen-gate・衝突拒否・直列マージ鎖・テスト緑・コード消失なし・PR自動merged化・台帳整合・バイパス痕跡なし）。判定はstate全27コミット走査+GitHub activity APIの物証ベース。
 
 ### 使い方（新しいrepoへ）
@@ -22,8 +30,7 @@
 # 各AIセッションには「.agents/PROTOCOL.md を読んで従って」とだけ言う
 ```
 
-### 未了・既知の限界
-- ~/agents-kit 自体はローカルrepoのみ（GitHub未push。pushはユーザー判断待ち）。
+### 既知の限界
 - §7シンボル消失チェックはdoneのrebase解決ミスで消えたmainシンボルを原理的に捕捉できない（rebase後はremoved_by_brと区別不能）。そこはテストが唯一の番人（設計上の限界としてSPECに記載）。
 - タスクキューからの完全自律pickupは非目標（directive台帳は将来拡張に耐える構造）。
 - sandbox repoは実証の証跡として残置（不要なら GitHub上で削除: Settings→Delete this repository）。

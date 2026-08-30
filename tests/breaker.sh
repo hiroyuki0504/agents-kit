@@ -74,14 +74,14 @@ PYEOF
 }
 
 # ===========================================================================
-# (1) 同一 slug で 2 プロセス同時 start ×10
+# (1) 同一 slug で 2 プロセス同時 start ×20
 #     勝者 exit 0 / 敗者 exit 4 / claims に 1 ファイル / 敗者は exit 6 で死なない
 #     （SPEC §13「同時 claim 競争」、§5.3 の全 CAS パターンがループ継続であることの検証）
 # ===========================================================================
 REPO="$(mkrepo race_same)"; AG="$REPO/.agents/bin/agents"
 D="$(cd "$REPO" && "$AG" directive "race" 2>/dev/null | head -n1)"
 bad=0
-for i in $(seq 1 10); do
+for i in $(seq 1 20); do
   slug="r-$i"
   (cd "$REPO" && "$AG" start "$slug" --directive "$D" --paths "p$i/**" --intent "A$i") >"$SB_ROOT/a.out" 2>&1 & p1=$!
   (cd "$REPO" && "$AG" start "$slug" --directive "$D" --paths "p$i/**" --intent "B$i") >"$SB_ROOT/b.out" 2>&1 & p2=$!
@@ -93,8 +93,8 @@ for i in $(seq 1 10); do
   if printf '%s %s' "$rc1" "$rc2" | grep -qw 6; then bad=$((bad+1)); echo "  round $i: 敗者が exit 6 で死んだ (rc=$rc1/$rc2)"; continue; fi
   [ "$sorted" = "0,4," ] && [ "$n" = "1" ] || { bad=$((bad+1)); echo "  round $i NG: rc=$rc1/$rc2 claims=$n"; }
 done
-[ "$bad" -eq 0 ] && ok "(1) 同一slug同時start×10: 常に勝者1・敗者exit4・claim1・敗者はexit6にならない" \
-                 || ng "(1) 同一slug同時start: $bad/10 ラウンドで不正"
+[ "$bad" -eq 0 ] && ok "(1) 同一slug同時start×20: 常に勝者1・敗者exit4・claim1・敗者はexit6にならない" \
+                 || ng "(1) 同一slug同時start: $bad/20 ラウンドで不正"
 
 # ===========================================================================
 # (2) 別 slug・パス非重複で 2 プロセス同時 start → 両方成功（CAS 再評価で両 claim 残存）

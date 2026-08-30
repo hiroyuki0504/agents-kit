@@ -1,8 +1,11 @@
 #!/bin/bash
 # install.sh — agents-kit v1 導入スクリプト（SPEC §9/§10 準拠。冪等）
+# https://github.com/hiroyuki0504/agents-kit (MIT License)
 # 用法: install.sh <target-repo-path> [--no-push]（path 省略時 .）
 # グローバル設定（~/.claude、git config --global、repo 外の hooksPath 先）には一切触れない。
 set -u -o pipefail
+
+command -v python3 >/dev/null 2>&1 || { echo "エラー: python3 が必要（README の動作環境を参照）" >&2; exit 1; }
 
 KIT_DIR="$(cd "$(dirname "$0")" && pwd)/kit"
 if [ ! -f "$KIT_DIR/agents" ] || [ ! -f "$KIT_DIR/PROTOCOL.md" ]; then
