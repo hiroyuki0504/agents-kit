@@ -6,7 +6,7 @@
 
 日本語版: [README.ja.md](README.ja.md)
 
-<!-- demo-gif -->
+![agents-kit demo — claim race, last-instruction-wins, serialized merge, self-verified](docs/demo.gif)
 
 Run multiple AI coding sessions — Claude Code and Codex side by side, any mix of models and effort levels — against **one Git repository, in parallel, without conflicts**, while you keep giving instructions to whichever session you like.
 
