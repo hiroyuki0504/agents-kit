@@ -110,6 +110,37 @@ git show <sha>:claims/login-ui.json                        # any state at any po
 
 Who claimed what and when, which merge ran which tests, who acknowledged which directive — every state change is one commit with a readable message (`directive d00043` / `claim login-ui` / `ready` / `seen` / `lock merge` / `merge-log` / `release` / `evict`).
 
+## Continue with another AI when capacity runs low
+
+The optional relay runs **one AI at a time** in an existing claim worktree. It checks both subscription usage windows and the current conversation's context. At 15% remaining (configurable), it stops the worker, waits for its process group to exit, saves a local handoff, and starts another configured AI with more than 25% quota remaining. Selection uses the smallest remaining quota window, so a full weekly limit cannot be hidden by an available 5-hour limit.
+
+After `agents start`, change into its worktree:
+
+```sh
+.agents/bin/agents usage                         # query Codex and Claude, no inference
+.agents/bin/agents run --provider codex          # managed session, automatic handoff
+# Or --provider auto to choose the largest verified remaining quota.
+```
+
+For an AI that is already working, have it save progress and invoke the handoff itself:
+
+```sh
+.agents/bin/agents checkpoint --text "Implemented X; tests Y passed; next: Z"
+.agents/bin/agents handoff --from claude
+# When the current conversation has 12% context remaining:
+.agents/bin/agents handoff --from codex --context-remaining 12
+```
+
+`handoff` blocks the caller until the successor returns. Exit **9** tells the source AI to stop and report the outcome; it must not resume edits using its old context. `--force` explicitly requests a handoff even without a low-capacity signal; the successor still needs verified capacity. `--summary-file` imports a progress note, and `--prompt-file` supplies an additional task. Otherwise the existing claim and verbatim directives provide the task.
+
+Dirty and untracked files stay in the same worktree. The checkpoint contains the claim, directives, Git HEAD/status/diff summary, progress note, and last assistant message. It lives under the worktree's **Git directory** in `agents-relay/`, outside tracked files; credentials and full conversation histories are not copied. Running the relay does not itself commit, push, merge, purchase credits, or grant tool permissions. Workers retain CLI authentication and permission settings. Use the normal `done` / `merge` gates to validate and land the work after the relay returns.
+
+Unknown/stale quota, missing CLIs, expired observations, and low-capacity candidates are excluded. The relay never revisits a provider during one run and stops with a saved checkpoint if no candidate remains. A worktree lock prevents duplicate runners. Authentication, permission, and generic execution errors stop with exit 6 instead of pretending the task succeeded. Interrupts stop the managed process group. AI tools must not detach background editing processes from that group.
+
+**Supported telemetry:** Codex uses `account/rateLimits/read` and the exact worker session's local token-count records. Claude uses the CLI stream's `get_usage` and `get_context_usage` control requests. Claude's usage interface is experimental; unsupported versions report unknown capacity. Claude stream usage can also use an explicitly configured `context_window_tokens` as a fallback. Context size is never guessed from a model name. The relay supervises sessions it starts; an existing Codex app or interactive Claude conversation uses the cooperative `handoff` path above.
+
+See [the relay configuration and adapter contract](docs/relay.md) for thresholds, other AIs, compatibility, and API references.
+
 ## Configuration
 
 `.agents/config.json` is clone-local — it is never committed. On another clone, rerun `install.sh` and set `test_cmd` again.
@@ -170,16 +201,18 @@ Untested. The kit targets macOS and Linux (POSIX sh + bash + python3); CI runs t
 
 Layout of this repository:
 
-- `kit/agents`, `kit/PROTOCOL.md` — the distributed payload (coordination CLI + the protocol the AIs follow)
+- `kit/agents`, `kit/agents_relay.py`, `kit/PROTOCOL.md` — the distributed CLI, optional AI relay, and protocol
 - `install.sh` — installer (idempotent; rerun to roll out kit updates), `uninstall.sh` — remover, `demo.sh` — self-verifying local demo
 - `tests/smoke.sh`, `tests/breaker.sh`, `tests/uninstall.sh` — end-to-end, adversarial, and uninstall suites against a local bare origin (no network, no gh)
-- `SPEC.md` — the full v1 specification; `BRIEF.md` — the design input, including the eight failures
-- `.github/workflows/tests.yml` — CI: all three suites plus `demo.sh` on ubuntu-latest and macos-latest
+- `tests/test_relay.py` — offline native protocol and subprocess handoff tests
+- `SPEC.md` — coordination and handoff specifications; `BRIEF.md` — the original design input
+- `.github/workflows/tests.yml` — CI: all suites plus `demo.sh` on ubuntu-latest and macos-latest (public repository)
 
 Run the tests:
 
 ```sh
 bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh   # 33 + 14 + 32 checks, all local
+python3 -B tests/test_relay.py                  # capacity and subprocess handoff tests
 bash demo.sh                                   # the full coordination story, self-verified
 ```
 

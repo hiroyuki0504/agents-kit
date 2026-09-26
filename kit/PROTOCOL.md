@@ -47,7 +47,7 @@
    - 同じ directive を既に担当している claim が表示されたら、後追いの claim を取らずその担当に任せよ（同一指示の二重実装を防ぐ）。
    - branch 名 `agent/<id>/<slug>` の id は **claim ごとに採番**される。同一セッションでも claim が変われば id は変わる。id からセッションの同一性を推定するな。
 
-4. 表示された worktree に `cd` して実装せよ。コミットは小さく分けよ。30 分ごと目安に worktree 内で `agents sync` を実行せよ（claim の延命は worktree 内での sync だけが行う）。
+4. 表示された worktree に `cd` して実装せよ。コミットは小さく分けよ。30 分ごと目安に worktree 内で `agents sync` を実行せよ（claim の延命は worktree 内での sync だけが行う）。長い作業では下記「利用枠・コンテキスト不足時の引き継ぎ」に従え。
 
 5. 完成したら worktree 内で:
 
@@ -66,6 +66,17 @@
    merge はロック取得 → クリーン worktree でマージ → シンボル消失チェック → 全テスト → main push → 反映確認 → 後片付けを行う。
    - merge は **ready な claim なら誰が実行してもよい**（done した本人でなくてよい。ロックと main push の FF 検査が安全を担保する）。
    - ロック保持中で exit 4 になったら 30〜60 秒おきに再実行して待て（保持者の merge はテスト実行を含むため数分かかりうる）。
+
+### 利用枠・コンテキスト不足時の引き継ぎ
+
+- 作業の区切りごとに `agents checkpoint --text "完了内容 / 検証結果 / 未完了事項 / 次の手順"` を実行せよ。認証情報を含めるな。メモは Git 管理外の worktree 固有 gitdir に保存される。
+- 利用枠の警告が出た時と長い工程の開始前に `agents usage --provider codex`（Claude なら `claude`）で自分の残量を確認せよ。5 時間・週間など複数の窓のうち最も少ない残量が基準になる。推論リクエストは発生しない。
+- 自分の利用枠または現在の会話のコンテキスト残量が閾値（既定 15%）以下になったら、実行中のツールを終わらせ、メモを更新して `agents handoff --from codex` を実行せよ。会話残量は実測値を `--context-remaining 12` の形で渡せ。推測の数値を渡すな。
+- `handoff` は残量が確認できる別の AI を選び、同じ claim / branch / worktree で前景実行する。呼び出し元は待機し、ファイルを並行編集するな。未コミット・未追跡ファイルはその場に残り、勝手に commit/push されない。
+- **exit 9 は元の AI への停止信号**。引き継ぎ先が返った場合も、空きがなく停止した場合も、古い文脈で実装を再開するな。コマンド出力と記録先をユーザーに報告せよ。exit 6 は認証・権限・実行などの異常であり、完了ではない。
+- `AGENTS_RELAY_ACTIVE` が設定されている場合、監視付き `agents run` の配下である。追加の run/handoff やバックグラウンド AI を起動するな。メモを更新し、実装・検証の結果を返せ。merge/release は監視プロセスの終了後に行え。
+- `agents run --provider codex` は新しい CLI セッションを起動し、利用枠とコンテキストを定期監視する入口である。既に開いている Codex アプリや Claude の会話を外から停止する機能ではない。既存の会話からは上記 handoff を使え。
+- 未取得・古い残量を「余裕あり」と解釈するな。空きがなければ記録を残して停止する。追加課金、認証の切り替え、権限の回避を行うな。
 
 ## 4. 異常系プレイブック（症状で引け）
 
@@ -119,6 +130,10 @@
 | `agents merge [<slug>] [--seen dNN]` | 直列化された唯一の main 反映経路 |
 | `agents release [<slug>] [--force]` | claim の自発的解放（branch と worktree は残る） |
 | `agents evict [--dry-run] [--lock-only]` | TTL 切れ claim / lock の掃除 |
+| `agents usage [--provider codex\|claude] [--json]` | 利用枠を CLI から取得（推論なし） |
+| `agents checkpoint --text "<進捗>"` / `--file <path>` | 引き継ぎ用メモをローカル保存 |
+| `agents run [--provider auto\|codex\|claude] [--prompt-file <path>]` | AI を前景起動し、残量不足で別 AI に逐次切り替え |
+| `agents handoff --from <provider> [--context-remaining <0..100>] [--summary-file <path>]` | 既存の AI から別 AI へ引き継ぎ。`--force` は手動の切り替え要求 |
 
 `--seen` は表示された**最大 seq を 1 つだけ**指定する（それ以下の全 directive を ack したことになる。自分が記録した directive は記録時点で ack 済み）。
 
@@ -134,6 +149,7 @@
 | 6 | 外部コマンド失敗（git 致命エラー、build/test 失敗、worktree 作成失敗、state 巻き戻り検知） |
 | 7 | 検証失敗（クリーン worktree 検査、シンボル消失、origin/main 反映確認） |
 | 8 | **claim 喪失 = 作業停止シグナル**。作業を止めてプレイブック「claim が evict されていた」へ |
+| 9 | **引き継ぎ元の停止シグナル**。空き不足・回数上限による保存停止、または引き継ぎ先の実行終了 |
 
 ## 8. 付録
 

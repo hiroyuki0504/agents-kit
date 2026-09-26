@@ -45,3 +45,13 @@
 - §7シンボル消失チェックはdoneのrebase解決ミスで消えたmainシンボルを原理的に捕捉できない（rebase後はremoved_by_brと区別不能）。そこはテストが唯一の番人（設計上の限界としてSPECに記載）。
 - タスクキューからの完全自律pickupは非目標（directive台帳は将来拡張に耐える構造）。
 - sandbox repoは実証の証跡として残置（不要なら GitHub上で削除: Settings→Delete this repository）。
+
+## 2026-09-27: 利用枠・コンテキスト不足時の AI 引き継ぎ
+
+本人の依頼により、Codex / Claude と他 AI のカスタムアダプターに対応する `usage` / `checkpoint` / `run` / `handoff` を追加。利用枠とコンテキストの両方を対象とすることは本人確認済み。
+
+- 残り 15% で停止し、25% 超の確認済み利用枠がある別の AI に同じ claim/worktree を引き継ぐ。未コミットの変更とローカルの要約を保持する。空き不足、繰り返し、二重起動、権限不足、claim 喪失時の扱いを実装。
+- ローカル検証: smoke 33、breaker 14、uninstall 32、demo 13、relay 30、計 **122 件 PASS**。relay はローカル bare origin と模擬 CLI を使い、両方の残量トリガー、プロセスグループ停止、再開、native 通信形式を検証。
+- 実 CLI 検証: Codex 0.157.1 と Claude Code 2.1.283 で推論なしの利用枠取得成功。Claude の context control で現在の使用量/容量を取得。Codex はツールを使わない短い応答テストに成功し、同じ UUID の rollout からコンテキスト残量を取得。
+- 2 つの実 AI に実装作業を交互にさせる長時間実証は未実施。Claude の usage control は実験的 API なので、取得不能なら残量不明として移行先から除外する。
+- installer、英日 README、PROTOCOL、SPEC、CI に反映。公開 repo の既存 GitHub-hosted CI を使用する。

@@ -8,8 +8,8 @@ set -u -o pipefail
 command -v python3 >/dev/null 2>&1 || { echo "エラー: python3 が必要（README の動作環境を参照）" >&2; exit 1; }
 
 KIT_DIR="$(cd "$(dirname "$0")" && pwd)/kit"
-if [ ! -f "$KIT_DIR/agents" ] || [ ! -f "$KIT_DIR/PROTOCOL.md" ]; then
-  echo "エラー: 同梱物が見つからない: $KIT_DIR/agents, $KIT_DIR/PROTOCOL.md" >&2
+if [ ! -f "$KIT_DIR/agents" ] || [ ! -f "$KIT_DIR/agents_relay.py" ] || [ ! -f "$KIT_DIR/PROTOCOL.md" ]; then
+  echo "エラー: 同梱物が見つからない: $KIT_DIR/agents, $KIT_DIR/agents_relay.py, $KIT_DIR/PROTOCOL.md" >&2
   exit 1
 fi
 
@@ -184,6 +184,7 @@ dirty_candidate "$HOOK_REL" hook
 # ---------------------------------------------------------------------------
 mkdir -p "$T/.agents/bin"
 cp "$KIT_DIR/agents" "$T/.agents/bin/agents"
+cp "$KIT_DIR/agents_relay.py" "$T/.agents/bin/agents_relay.py"
 chmod +x "$T/.agents/bin/agents"
 cp "$KIT_DIR/PROTOCOL.md" "$T/.agents/PROTOCOL.md"
 CONFIG_CREATED=0
@@ -389,6 +390,7 @@ push_files() {  # 一時 index で commit を構築して push。$1 = リトラ�
     GIT_INDEX_FILE="$TMPIDX" g update-index --add --cacheinfo "$2,$blob,$1" || return 1
   }
   add_one ".agents/bin/agents" 100755 || return 1
+  add_one ".agents/bin/agents_relay.py" 100644 || return 1
   add_one ".agents/PROTOCOL.md" 100644 || return 1
   # AGENTS.md / CLAUDE.md は symlink の実体側（repo 外実体は追加しない）。config.json は含めない（ignore 済み・クローンローカル）
   local seen_real=""

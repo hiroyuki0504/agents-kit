@@ -4,6 +4,6 @@
 
 ## Checklist
 
-- [ ] Tests pass locally: `bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh && bash demo.sh`
+- [ ] Tests pass locally: `bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh && python3 -B tests/test_relay.py && bash demo.sh`
 - [ ] User-facing changes update **both** `README.md` and `README.ja.md` — or this PR has none
 - [ ] Shell changes stay **bash 3.2** compatible (no bash 4+ features; `${var}` before non-ASCII text) — or this PR has none
