@@ -124,6 +124,37 @@ git show <sha>:claims/login-ui.json                        # 任意時点の状�
 
 誰がいつ何を宣言し、どのマージがどのテストを走らせ、誰がどの指示を ack したか — 状態変更は1件1コミットで、メッセージ（`directive d00043` / `claim login-ui` / `ready` / `seen` / `lock merge` / `merge-log` / `release` / `evict`）だけで流れが読めます。
 
+## 利用枠・コンテキストが少なくなったら別の AI に引き継ぐ
+
+既存の claim worktree で、Codex / Claude を **1 つずつ**起動する機能です。利用枠または会話のコンテキストが残り 15% 以下になると、実行中の AI とその子プロセスの停止を待ち、引き継ぎ記録を保存して、利用枠が 25% 超ある別の AI を起動します。閾値は変更できます。5 時間枠・週間枠などのうち、残りが最も少ない窓で判断します。
+
+`agents start` で作った worktree に移動して実行します。
+
+```sh
+.agents/bin/agents usage                         # Codex / Claude の利用枠を取得（推論なし）
+.agents/bin/agents run --provider codex          # 起動から自動監視・引き継ぎまで
+# --provider auto なら、確認できた利用枠が最も多い AI から開始
+```
+
+既に作業中の AI には、進捗を保存してから引き継ぎを実行させます。
+
+```sh
+.agents/bin/agents checkpoint --text "X を実装。Y のテスト通過。次は Z"
+.agents/bin/agents handoff --from claude
+# 現在の会話のコンテキストが残り 12% の場合:
+.agents/bin/agents handoff --from codex --context-remaining 12
+```
+
+呼び出し元は後続の AI が返るまで待機します。終了コード **9 は元の AI への停止信号**です。引き継ぎ後に古い文脈で実装を再開せず、結果を報告させてください。`--force` は残量不足以外の理由で明示的に切り替える指定です。移行先の残量確認は省略しません。`--summary-file` で進捗メモ、`--prompt-file` で追加の依頼を渡せます。通常は既存の claim と指示原文から続きを判断します。
+
+未コミット・未追跡のファイルは同じ worktree に残します。引き継ぎ記録には claim、指示原文、Git HEAD・変更一覧、進捗メモ、直前の AI の発言を保存します。保存先は worktree 固有の **Git ディレクトリ**内の `agents-relay/` で、コミット対象には入りません。認証情報や会話履歴全体はコピーしません。
+
+残量不明・古い情報・未インストールの AI は移行先から除外します。1 回の実行で同じ AI に戻らず、空きがなくなれば記録を残して停止します。worktree ごとのロックで二重起動を防止します。認証・権限・一般的な実行エラーは終了コード 6 とし、完了とは扱いません。追加課金や権限の自動承認は行いません。認証と権限は各 CLI の設定に従い、反映には従来の `done` / `merge` の検証を使います。
+
+Codex は利用枠 API と対象セッションだけのトークン記録、Claude は CLI の `get_usage` / `get_context_usage` で監視します。Claude の利用枠取得は実験的 API のため、未対応バージョンでは残量不明になります。コンテキスト容量はモデル名から推測しません。監視対象は `run` が起動した CLI です。既に開いている Codex アプリや Claude の会話からは上記 `handoff` を使います。AI に編集用プロセスを独立したバックグラウンドとして残させないでください。
+
+詳細な設定と別 AI の追加方法は [relay の設定・アダプター仕様](docs/relay.md) を参照してください。
+
 ## config.json の設定
 
 `.agents/config.json`（クローンローカル。コミットされません。別クローンでは install.sh を再実行して再設定）:
@@ -182,10 +213,11 @@ claim には TTL があります（既定 24 時間。worktree 内の `agents sy
 
 ## 開発リポジトリ構成（このディレクトリ）
 
-- `kit/agents` / `kit/PROTOCOL.md` — 配布物本体（調整 CLI + AI が従う規約）
+- `kit/agents` / `kit/agents_relay.py` / `kit/PROTOCOL.md` — 調整 CLI・AI 引き継ぎ機能・AI が従う規約
 - `install.sh` — 導入スクリプト（冪等。再実行で kit を更新配布）、`uninstall.sh` — 撤去スクリプト、`demo.sh` — 自動検証つきローカルデモ
 - `tests/smoke.sh` / `tests/breaker.sh` / `tests/uninstall.sh` — ローカル bare origin を使った自動検証（`bash tests/smoke.sh && bash tests/breaker.sh && bash tests/uninstall.sh`）
 - `SPEC.md` / `BRIEF.md` — 仕様と設計入力
+- `tests/test_relay.py` — 利用枠・コンテキスト判定、CLI 通信、子プロセス停止と引き継ぎのオフライン検証
 - `.github/workflows/tests.yml` — CI（ubuntu / macos で全テスト）
 
 コントリビューションは [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。

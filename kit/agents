@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """agents — マルチAIセッション協調キット CLI（agents-kit v1）。
 
-SPEC.md 完全準拠の単一ファイル実装。標準ライブラリのみ（python 3.9+ / git 2.30+）。
+SPEC.md 準拠。標準ライブラリのみ（python 3.9+ / git 2.30+）。
 調整媒体は origin 上の orphan ブランチ agent-state。全状態変更は WRITE-STATE（CAS）を通る。
 プロジェクト: https://github.com/hiroyuki0504/agents-kit（MIT License）
 """
@@ -21,6 +21,9 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.dont_write_bytecode = True
+import agents_relay
 
 # ============================================================================
 # 定数（SPEC §14。スクリプト先頭に集約）
@@ -65,6 +68,7 @@ CONFIG_DEFAULTS = {
     "claim_ttl_hours": 24,
     "merge_lock_ttl_min": 30,
     "pr": "auto",
+    "relay": None,
 }
 
 FETCH_ADVICE = (
@@ -2185,6 +2189,7 @@ def build_parser():
 
     p = sub.add_parser("doctor", help="read-only の健全性検査（状態を一切変更しない）")
     p.add_argument("--run-tests", dest="run_tests", action="store_true")
+    agents_relay.add_parsers(sub)
     return ap
 
 
@@ -2193,6 +2198,8 @@ COMMANDS = {
     "status": cmd_status, "done": cmd_done, "merge": cmd_merge,
     "release": cmd_release, "evict": cmd_evict, "doctor": cmd_doctor,
 }
+for _relay_command in ("usage", "run", "handoff", "checkpoint"):
+    COMMANDS[_relay_command] = lambda args: agents_relay.main(args, sys.modules[__name__])
 
 
 def main(argv):

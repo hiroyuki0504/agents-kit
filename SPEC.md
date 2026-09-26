@@ -1,4 +1,18 @@
-# SPEC: agents-kit v1 — マルチAIセッション協調キット 実装仕様（最終版）
+# SPEC: agents-kit — マルチAIセッション協調キット 実装仕様
+
+## 追加仕様: 利用枠・コンテキストによる AI 引き継ぎ（2026-09-27）
+
+従来の協調 CLI に opt-in の `usage` / `checkpoint` / `run` / `handoff` を追加する。実装は標準ライブラリのみの `kit/agents_relay.py`。installer は `.agents/bin/agents` と同じ場所に配置・配布する。既存の claim、後勝ち directive、done/merge の検証規則は維持する。
+
+1. 利用枠（5 時間・週間等）と会話コンテキストを独立に測定する。既定の切り替え閾値はいずれも残り 15%。移行先は全観測窓が新鮮で最小残量が 25% 超の別 provider。取得失敗・未取得・300 秒より古い観測・リセット時刻経過を空きと解釈しない。容量やリセット後の残量を推測しない。
+2. `run` は claim worktree 内でだけ動く。ローカル flock で 1 つの監視プロセスに限定し、子 AI を前景実行する。閾値到達時はプロセスグループに SIGINT → 有限待機 → SIGTERM/SIGKILL を送り、停止を確認してから引き継ぐ。並列の後続 AI や無限往復を作らない。既定最大 3 遷移、使用済み provider を除外する。
+3. 同じ worktree / branch / claim を使う。未コミット・未追跡ファイルをそのまま残す。起動前ごとに claim の `(slug, agent, branch)`、実 branch、Git 操作途中でないことを検証する。担当範囲を解放しない。監視中は通常の claim 更新規則で延命する。子は relay を再帰起動せず、merge/release は監視終了後に行う。
+4. `checkpoint` は完了事項・検証結果・未完了事項・次の手順を保存する。引き継ぎ時はこれに directive 原文、claim、HEAD、status、diff stat、直前の assistant 発言を添える。worktree 固有 gitdir の `agents-relay/` に所有者のみ読めるファイルで保存する。認証ファイルや会話履歴全体は読み出さず、メモは Git 台帳に push しない。
+5. `handoff --from <provider>` は既存の協力的 AI が同期的に呼び出す。コンテキスト残量は `--context-remaining <0..100>` で実測値を入力可能。自分の枠が閾値以下、または明示 `--force` のときに後続を選ぶ。呼び出し元は待機し、終了コード 9 を受けたら古い文脈での編集を停止して報告する。`run` は既存 GUI 会話を外部から停止する機能ではない。
+6. 空き・回数不足は記録保存後 exit 9。元の AI への引き継ぎ終了通知も exit 9。二重監視は exit 4、claim 喪失は exit 8、CLI/権限/一般実行エラーは exit 6。正常 result と正常終了を実装・検証・main 反映の証拠として混同しない。追加課金・権限の自動承認・認証の切り替えをしない。
+7. Codex は app-server の rateLimits と当該 UUID の rollout の last token usage を用いる。Claude は CLI の usage/context control と structured stream を用いる。API 変更時は unknown とする。カスタム AI は argv 配列と timestamp 付き正規化 JSON を使う。詳細契約・設定・公式参照は `docs/relay.md`。
+
+以下は従来の協調部分の仕様である。単一ファイルという記載は協調 CLI 本体に適用し、追加の relay モジュールは上記仕様に従う。
 
 作成: 2026-08-30。入力は BRIEF.md。初稿に対する敵対レビュー3系統（並行性・アトミック性 / AI追従性・運用エルゴノミクス / 障害・復旧・エッジケース）の裁定を反映した最終版。本書だけを読めば追加判断ゼロで実装できることを目標とする。
 実装物は `install.sh`、`.agents/bin/agents`（python3 単一ファイル、標準ライブラリのみ）、`.agents/PROTOCOL.md` の3つ。
