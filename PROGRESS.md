@@ -1,57 +1,18 @@
-# PROGRESS — agents-kit
+# Release notes
 
-## 2026-08-31 v1.1.0 — 英語圏対応と実用性強化
+## 2026-09-27
 
-(English summary: v1.1.0 adds an English-first README, a self-verifying local demo `demo.sh`, an `agents doctor` preflight, `uninstall.sh` plus a 32-check suite, contributor docs, and a 4-step CI. The v1.0 live-run record below is in Japanese; the README's "Born from 8 real failures" table is its English distillation.)
+- Added `usage`, `checkpoint`, `run`, and `handoff` for CLI usage and context monitoring.
+- Handoffs preserve the active claim, worktree, uncommitted changes, and local summary.
+- Unavailable or unverified usage data prevents selection of a handoff target.
+- Claude usage control uses an experimental API. Long-running alternating implementations across providers remain unverified.
 
-- README.md を英語主体に全面リライト（実敗8件の表・mermaid図・FAQ）、README.ja.md（日本語完全版）を新設。
-- `demo.sh`: AI・ネットワーク不要で claim競争→後勝ち→seenゲート→直列マージの全物語を実演・自動検証（13アサート・約5秒）。CIにも組み込み。
-- `agents doctor`: read-only の健全性検査11項目（SPEC §8.9）。smoke に4検査追加（計33）。install.sh 完了時に案内。
-- `uninstall.sh`: マーカーベースの完全撤去（agent-state 台帳は既定で保持、--purge-remote で削除）+ tests/uninstall.sh（32検査）。
-- CONTRIBUTING / issue・PRテンプレート新設。CI は smoke 33 + breaker 14 + uninstall 32 + demo の4ステップ（ubuntu / macos）。
-- 開発手順: 5本の隔離worktreeで並列ビルド → squash統合 → 敵対レビュー2系統（blocker 0・新規コンテンツの漏えいゼロ）→ 全スイート緑を確認して公開。
+## 2026-08-31 — v1.1.0
 
-## 2026-08-31 OSS公開（v1.0.0）
+- Added English and Japanese documentation, contributor guidance, and issue/PR templates.
+- Added the self-contained `demo.sh`, `agents doctor`, and marker-based uninstall support.
 
-- https://github.com/hiroyuki0504/agents-kit として public 公開（MIT License）。
-- 追加: LICENSE / README 英語イントロ+CIバッジ+動作環境+`--no-push` 案内 / GitHub Actions CI（ubuntu+macos で smoke+breaker 全検査）/ 配布物への出自ヘッダ / install.sh の python3 fail-fast ガード。
-- breaker (1) の同時claim競争を×10→×20に引き上げ（BRIEF/SPEC の成功基準「20回」と実装を一致させた）。
-- 公開前監査: 読み取り専用の敵対監査2系統（情報漏えい / 第三者ユーザビリティ、全12ファイル精読）で blocker 0・秘密情報/個人情報/私的文脈の漏えいゼロを確認。指摘4件は全て本公開コミットで反映。
-- git履歴は全コミット author/committer = `Claude <noreply@anthropic.com>` で私的情報ゼロのため、フル履歴のまま公開。
+## 2026-08-31 — v1.0.0
 
-## 2026-08-30 v1 完成（設計→実装→実GitHub実証まで完了）
-
-### これは何か
-1つのGitHub repoに対し、別々のターミナルの複数AI（Claude Code / Codex混在・モデル/effort混在）が、ユーザーの随時指示を受けながらコンフリクトなく並行実装するための汎用調整キット。Claude固有機能に非依存（git + python3標準ライブラリ + 任意でgh）。
-
-### 中核設計（SPEC.md が正）
-- 調整媒体 = origin上のorphanブランチ `agent-state`。push のfast-forward検査をCASとして使う（push拒否=正常な調整イベント）。
-- **後勝ち**: agent-stateのコミット順=全順序。seq最大のdirectiveが正。done/merge前の`--seen`復唱ゲートで未読のまま進めない。
-- 担当宣言（claim）はアトミック、実装は各自worktree（origin/main SHA固定）、マージは`agents merge`のみ（ロック直列化+クリーンworktreeでシミュレーション+シンボル消失チェック+1マージごと全テスト+FF検査）。
-- main / agent-state への直接pushはpre-pushフックが拒否（core.hooksPath対応、既存フックの先頭に前置）。
-
-### 検証状態
-- tests/smoke.sh 29検査 + tests/breaker.sh 14検査 全PASS（ローカルbare origin。同時claim×20、merge途中kill回収、ゾンビexit 8、stale lock奪取、master既定repo、敵対的既存フック等）。
-- 実GitHub実証: private repo `hiroyuki0504/agents-kit-sandbox` で3並列AIセッション（fable/high・sonnet/medium・fable/low）が生シミュレーション。**9基準全PASS・プロトコル違反ゼロ**（後勝ち実行・seen-gate・衝突拒否・直列マージ鎖・テスト緑・コード消失なし・PR自動merged化・台帳整合・バイパス痕跡なし）。判定はstate全27コミット走査+GitHub activity APIの物証ベース。
-
-### 使い方（新しいrepoへ）
-```
-~/agents-kit/install.sh /path/to/repo   # 冪等。再実行でkit更新配布
-# .agents/config.json の test_cmd を設定（必須）
-# 各AIセッションには「.agents/PROTOCOL.md を読んで従って」とだけ言う
-```
-
-### 既知の限界
-- §7シンボル消失チェックはdoneのrebase解決ミスで消えたmainシンボルを原理的に捕捉できない（rebase後はremoved_by_brと区別不能）。そこはテストが唯一の番人（設計上の限界としてSPECに記載）。
-- タスクキューからの完全自律pickupは非目標（directive台帳は将来拡張に耐える構造）。
-- sandbox repoは実証の証跡として残置（不要なら GitHub上で削除: Settings→Delete this repository）。
-
-## 2026-09-27: 利用枠・コンテキスト不足時の AI 引き継ぎ
-
-本人の依頼により、Codex / Claude と他 AI のカスタムアダプターに対応する `usage` / `checkpoint` / `run` / `handoff` を追加。利用枠とコンテキストの両方を対象とすることは本人確認済み。
-
-- 残り 15% で停止し、25% 超の確認済み利用枠がある別の AI に同じ claim/worktree を引き継ぐ。未コミットの変更とローカルの要約を保持する。空き不足、繰り返し、二重起動、権限不足、claim 喪失時の扱いを実装。
-- ローカル検証: smoke 33、breaker 14、uninstall 32、demo 13、relay 30、計 **122 件 PASS**。relay はローカル bare origin と模擬 CLI を使い、両方の残量トリガー、プロセスグループ停止、再開、native 通信形式を検証。
-- 実 CLI 検証: Codex 0.157.1 と Claude Code 2.1.283 で推論なしの利用枠取得成功。Claude の context control で現在の使用量/容量を取得。Codex はツールを使わない短い応答テストに成功し、同じ UUID の rollout からコンテキスト残量を取得。
-- 2 つの実 AI に実装作業を交互にさせる長時間実証は未実施。Claude の usage control は実験的 API なので、取得不能なら残量不明として移行先から除外する。
-- installer、英日 README、PROTOCOL、SPEC、CI に反映。公開 repo の既存 GitHub-hosted CI を使用する。
+- Initial release of Git-based claims, ordered directives, and serialized merges.
+- See `SPEC.md` for the protocol, test requirements, and known limitations.
